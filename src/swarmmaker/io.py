@@ -1,10 +1,9 @@
 """IO helpers for SwarmMaker runs."""
-import json
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
-from .schemas import RunResult
+from .schemas import RunResult, canonical_json
 
 
 def ensure_log_dir(path: Path) -> Path:
@@ -13,7 +12,7 @@ def ensure_log_dir(path: Path) -> Path:
 
 
 class EventLogger:
-    """Append-only JSONL event logger."""
+    """Append-only JSONL logger with canonical serialization."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -21,20 +20,36 @@ class EventLogger:
         if not self.path.exists():
             self.path.touch()
 
-    def log(self, event_type: str, payload: Dict[str, Any] | None = None) -> None:
+    def log(
+        self,
+        event_type: str,
+        payload: Optional[Dict[str, Any]] = None,
+        *,
+        step_id: Optional[int] = None,
+        agent: Optional[str] = None,
+        stage: Optional[str] = None,
+        signature: Optional[str] = None,
+        message: Optional[str] = None,
+    ) -> None:
         entry = {
-            "ts": datetime.utcnow().isoformat(),
-            "event": event_type,
+            "timestamp": datetime.utcnow().isoformat(),
+            "type": event_type,
+            "step_id": step_id,
+            "agent": agent,
+            "stage": stage,
+            "signature": signature,
+            "message": message,
             "payload": payload or {},
         }
         with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            handle.write(canonical_json(entry) + "\n")
 
 
 def save_json_result(result: RunResult, path: Path) -> None:
     ensure_log_dir(path.parent)
+    payload = result.model_dump(mode="python")
     with path.open("w", encoding="utf-8") as handle:
-        handle.write(result.model_dump_json(indent=2, by_alias=True))
+        handle.write(canonical_json(payload))
 
 
 def save_markdown_result(result: RunResult, path: Path) -> None:
@@ -44,41 +59,28 @@ def save_markdown_result(result: RunResult, path: Path) -> None:
 
 
 def render_result_markdown(result: RunResult) -> str:
-    """Generate the result.md body."""
     stats = result.stats
-    summary_lines = [
+    lines = [
+        "## Task",
+        result.task.strip(),
+        "",
+        "## Final Answer",
+        (result.final_answer or "No final answer produced.").strip(),
+        "",
+        "## Stats",
         f"- Steps: {len(result.steps)}",
         f"- Elapsed: {stats.elapsed_s:.2f}s",
         f"- LLM calls: {stats.llm_calls}",
         f"- Tokens in/out: {stats.tokens_in}/{stats.tokens_out}",
-    ]
-    if stats.aborted_reason:
-        summary_lines.append(f"- Aborted: {stats.aborted_reason}")
-    stats_lines = [
-        f"- Tokens in: {stats.tokens_in}",
-        f"- Tokens out: {stats.tokens_out}",
-        f"- LLM calls: {stats.llm_calls}",
         f"- Retries: {stats.retries}",
         f"- Consensus votes: {stats.consensus_votes}",
     ]
-    artifacts_lines = []
+    if stats.aborted_reason:
+        lines.append(f"- Aborted: {stats.aborted_reason}")
     if result.artifacts.langsmith_run_url:
-        artifacts_lines.append(f"- LangSmith: {result.artifacts.langsmith_run_url}")
+        lines.append(f"- LangSmith: {result.artifacts.langsmith_run_url}")
     if result.artifacts.events_path:
-        artifacts_lines.append(f"- Events: {result.artifacts.events_path}")
-
-    body = [
-        "## Task",
-        result.task.strip(),
-        "",
-        "## Final answer",
-        (result.final_answer or "No final answer produced.").strip(),
-        "",
-        "## Execution summary",
-        "\n".join(summary_lines),
-        "",
-        "## Stats",
-        "\n".join(stats_lines + artifacts_lines),
-        "",
-    ]
-    return "\n".join(body)
+        lines.append(f"- Events: {result.artifacts.events_path}")
+    if result.artifacts.result_json_path:
+        lines.append(f"- Result JSON: {result.artifacts.result_json_path}")
+    return "\n".join(lines) + "\n"

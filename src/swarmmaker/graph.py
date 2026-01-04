@@ -1,13 +1,12 @@
 """LangGraph workflow for SwarmMaker."""
+import asyncio
 import json
 import random
-import re
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence, TypedDict, TypeVar
+from typing import Any, Dict, List, Optional, Sequence, TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from pydantic import ValidationError
-from langgraph.graph import END, StateGraph
+from langgraph.graph import END, START, StateGraph
 
 from .callbacks import LiveSwarmDisplay
 from .consensus import ConsensusEngine
@@ -21,34 +20,33 @@ from .schemas import (
     RunResult,
     RunStats,
     StepRecord,
-    StructuredLLMOutput,
-    StructuredParseResult,
     SwarmConfig,
 )
 from .verify import ActionVerifier
 
-try:  # Optional LangSmith client for root run tracking.
+try:  # pragma: no cover - optional LangSmith dependency
     from langsmith import Client as LangSmithClient
-except Exception:  # pragma: no cover - optional dependency at runtime.
+except Exception:  # pragma: no cover
     LangSmithClient = None  # type: ignore[assignment]
 
 
 class GraphState(TypedDict, total=False):
     task: str
-    config: SwarmConfig
     runtime: "RuntimeContext"
-    step_counter: int
-    steps_completed: int
     planner_step: Optional[PlannerStep]
     candidates: List[Action]
-    judge_candidates: List[Action]
     chosen_action: Optional[Action]
-    needs_judge: bool
-    retrying: bool
+    judge_needed: bool
     done: bool
-    final_answer: Optional[str]
     abort_reason: Optional[str]
+    final_answer: Optional[str]
+    notes: List[str]
+    draft_answer: Optional[str]
+    history_signatures: List[str]
+    steps_completed: int
     history: List[StepRecord]
+    votes: Dict[str, int]
+    retry_step: bool
 
 
 @dataclass
@@ -77,11 +75,11 @@ class LangSmithManager:
         if self.enabled and LangSmithClient:
             try:
                 self.client = LangSmithClient()
-                run = self.client.create_run(
+                run = self.client.create_run(  # type: ignore[call-arg]
                     name="SwarmMaker",
                     inputs={"task": task},
                     project_name=project_name,
-                    run_type="chain",
+                    run_type="workflow",
                     tags=["swarmmaker"],
                     metadata={"task": task},
                 )
@@ -91,13 +89,10 @@ class LangSmithManager:
                 self.run_url = getattr(run, "url", None) or getattr(run, "dashboard_url", None)
                 if not self.run_url and isinstance(run, dict):
                     self.run_url = run.get("url")
-            except Exception:
+            except Exception:  # pragma: no cover - network
                 self.enabled = False
-                self.client = None
-                self.run_id = None
-                self.run_url = None
 
-    def complete(self, outputs: Optional[Dict] = None, error: Optional[str] = None) -> None:
+    def complete(self, outputs: Optional[Dict[str, Any]] = None, error: Optional[str] = None) -> None:
         if not (self.client and self.run_id):
             return
         try:
@@ -106,776 +101,547 @@ class LangSmithManager:
                 outputs=outputs or {},
                 error=error,
             )
-        except Exception:
+        except Exception:  # pragma: no cover - telemetry only
             pass
 
 
 def build_graph(config: SwarmConfig) -> StateGraph:
     graph = StateGraph(GraphState)
-
-    graph.add_node("planner", planner_node(config))
-    graph.add_node("voters", voters_node(config))
-    graph.add_node("consensus", consensus_node())
-    graph.add_node("judge", judge_node(config))
-    graph.add_node("verify", verify_node(config))
+    graph.add_node("check", check_node(config))
+    graph.add_node("plan", plan_node(config))
+    graph.add_node("propose", propose_node(config))
+    graph.add_node("aggregate", aggregate_node(config))
+    graph.add_node("verify_apply", verify_apply_node(config))
     graph.add_node("final", final_node())
 
-    graph.set_entry_point("planner")
-
+    graph.set_entry_point("check")
     graph.add_conditional_edges(
-        "planner",
-        lambda state: "final" if state.get("abort_reason") else "voters",
-        {
-            "final": "final",
-            "voters": "voters",
-        },
+        "check",
+        lambda s: "final" if s.get("abort_reason") or s.get("done") else "plan",
+        {"plan": "plan", "final": "final"},
     )
-
-    graph.add_edge("voters", "consensus")
-
-    graph.add_conditional_edges(
-        "consensus",
-        lambda state: "judge" if state.get("needs_judge") else "verify",
-        {
-            "judge": "judge",
-            "verify": "verify",
-        },
-    )
-
-    graph.add_conditional_edges(
-        "judge",
-        lambda state: "voters" if state.get("retrying") else "verify",
-        {
-            "voters": "voters",
-            "verify": "verify",
-        },
-    )
-
-    graph.add_conditional_edges(
-        "verify",
-        verify_router,
-        {
-            "planner": "planner",
-            "voters": "voters",
-            "final": "final",
-        },
-    )
-
+    graph.add_edge("plan", "propose")
+    graph.add_edge("propose", "aggregate")
+    graph.add_edge("aggregate", "verify_apply")
+    graph.add_conditional_edges("verify_apply", _verify_router, {"check": "check", "final": "final"})
     graph.add_edge("final", END)
+    graph.add_edge(START, "check")
     return graph
 
 
-def planner_node(config: SwarmConfig):
+def check_node(config: SwarmConfig):
     def _node(state: GraphState) -> GraphState:
         runtime = state["runtime"]
         metrics = runtime.metrics
-        if state.get("done"):
-            state["abort_reason"] = state.get("abort_reason") or "already done"
-            return state
-        if metrics.tokens_total() >= config.max_total_tokens:
-            state["abort_reason"] = "token budget exceeded"
-            runtime.events.log("abort", {"reason": state["abort_reason"]})
-            runtime.display.log_event("Budget exceeded, stopping.")
-            state["done"] = True
-            return state
-        if state.get("steps_completed", 0) >= config.max_steps:
-            state["abort_reason"] = "max steps reached"
-            runtime.events.log("abort", {"reason": state["abort_reason"]})
-            runtime.display.log_event("Max steps reached.")
-            state["done"] = True
-            return state
-        elapsed = runtime.metrics.snapshot(state.get("steps_completed", 0)).get("elapsed", 0.0)
-        if elapsed >= config.max_wall_seconds:
-            state["abort_reason"] = "wall clock limit reached"
-            runtime.events.log("abort", {"reason": state["abort_reason"]})
-            runtime.display.log_event("Wall clock limit reached.")
-            state["done"] = True
-            return state
+        elapsed = metrics.snapshot(state.get("steps_completed", 0)).get("elapsed", 0.0)
+        steps = state.get("steps_completed", 0)
 
+        if state.get("done") or state.get("abort_reason"):
+            return state
+        if steps >= config.max_steps:
+            state["abort_reason"] = "max steps reached"
+        elif metrics.tokens_total() >= config.max_total_tokens:
+            state["abort_reason"] = "token budget exceeded"
+        elif elapsed >= config.max_wall_seconds:
+            state["abort_reason"] = "wall clock limit reached"
+
+        if state.get("abort_reason"):
+            runtime.events.log(
+                "abort",
+                {"reason": state["abort_reason"]},
+                message=state["abort_reason"],
+            )
+            runtime.display.log_event(f"Stopping: {state['abort_reason']}")
+            state["done"] = True
+        runtime.display.update_metrics(
+            metrics.snapshot(
+                steps,
+                budget_remaining=max(config.max_total_tokens - metrics.tokens_total(), 0),
+            )
+        )
+        return state
+
+    return _node
+
+
+def plan_node(config: SwarmConfig):
+    def _node(state: GraphState) -> GraphState:
+        if state.get("abort_reason"):
+            return state
+        runtime = state["runtime"]
+        if state.pop("retry_step", False):
+            planner_step = state.get("planner_step")
+            if planner_step:
+                runtime.display.log_event(f"Retrying planner step {planner_step.step_id}")
+                runtime.events.log(
+                    "plan_retry",
+                    {"step_id": planner_step.step_id},
+                    step_id=planner_step.step_id,
+                    agent="planner",
+                    stage="plan",
+                )
+                runtime.display.set_panel_text(
+                    "PLANNER",
+                    json.dumps(planner_step.model_dump(), ensure_ascii=False, indent=2),
+                )
+                state["candidates"] = []
+                state["chosen_action"] = None
+                state["votes"] = {}
+                state["judge_needed"] = False
+                return state
         step_id = state.get("steps_completed", 0) + 1
-        budget_remaining = max(0, config.max_total_tokens - metrics.tokens_total())
-        planner_input = {
+        notes = state.get("notes", [])
+        draft = state.get("draft_answer")
+        metrics = runtime.metrics
+        budget_remaining = max(config.max_total_tokens - metrics.tokens_total(), 0)
+        summary = {
             "task": state["task"],
+            "notes": notes[-5:],
+            "draft_answer": draft,
+            "steps_completed": state.get("steps_completed", 0),
+            "history_signatures": state.get("history_signatures", [])[-5:],
             "token_budget_remaining": budget_remaining,
-            "swarm_size": config.swarm_size,
-            "recent_history": [
-                {
-                    "step_id": record.step_id,
-                    "goal": record.planner_step.step_goal,
-                    "chosen": record.chosen_signature,
-                }
-                for record in state.get("history", [])[-3:]
-            ],
+            "max_steps": config.max_steps,
         }
-        worker_token_hint = max(
-            32,
-            min(
-                512,
-                (budget_remaining // max(config.swarm_size, 1)) or 32,
-            ),
-        )
-        schema_hint = json.dumps(
-            {
-                "step_id": step_id,
-                "step_goal": "describe the immediate subtask you want workers to perform next",
-                "expected_action_schema": "Action",
-                "stop_condition": "continue|done",
-                "worker_max_tokens": worker_token_hint,
-            },
-            ensure_ascii=False,
-        )
-        examples = (
-            '{ "step_id": %d, "step_goal": "outline solution approach", '
-            '"expected_action_schema": "Action", "stop_condition": "continue", '
-            '"worker_max_tokens": %d }'
-            % (step_id, worker_token_hint)
-        )
-        wrapper_hint = _structured_wrapper_instructions("PlannerStep")
-        messages = [
+        planner_prompt = [
             SystemMessage(
                 content=(
-                    "You are the SwarmMaker planner.\n"
-                    f"{wrapper_hint}\n"
-                    "Fields (all required): step_id(int), step_goal(str), expected_action_schema (literal \"Action\"), "
-                    "stop_condition (either \"continue\" or \"done\"), worker_max_tokens (int between 16 and 2048 indicating the completion token cap per worker)."
+                    "You are the SwarmMaker planner coordinating specialist workers.\n"
+                    "If the task can be answered now based on the notes and draft answer, "
+                    'set stop_condition="done" and step_goal="produce final answer".\n'
+                    "Otherwise specify the single next goal the workers should execute.\n"
+                    "Output ONLY the PlannerStep JSON. Never include chain-of-thought or commentary."
                 )
             ),
             HumanMessage(
                 content=(
-                    f"Task:\n{state['task']}\n\n"
-                    f"Current state:\n{json.dumps(planner_input, ensure_ascii=False)}\n\n"
-                    f"Recommend a `worker_max_tokens` value <= {worker_token_hint} unless the task clearly requires more detail.\n"
-                    f"Schema hint:\n{schema_hint}\n"
-                    f"Example:\n{examples}\n"
-                    "Remember: respond with raw JSON only; never wrap in markdown fences."
+                    f"Task: {state['task']}\n"
+                    f"Context summary:\n{json.dumps(summary, ensure_ascii=False, indent=2)}\n"
+                    f"Choose worker_max_tokens <= {min(512, budget_remaining or 256)}."
                 )
             ),
         ]
         meta = AgentCallMeta(agent="planner", stage="PLANNER", step_id=step_id)
-        planner_result = _request_json(
-            runtime.llm,
-            messages,
+        schema = PlannerStep.model_json_schema()
+        result = runtime.llm.structured_completion(
+            planner_prompt,
             meta=meta,
             model=config.model_planner,
             temperature=config.temperature_planner,
+            schema_name="PlannerStep",
+            schema=schema,
             parser=PlannerStep.model_validate,
-            output_schema=PlannerStep.model_json_schema(),
-            runtime=runtime,
         )
-        planner_step = planner_result.content
-        runtime.events.log("planner_step", planner_step.model_dump())
-        if planner_result.thinking or planner_result.thinking_tokens is not None:
-            runtime.events.log(
-                "planner_thinking",
-                {
-                    "thinking": planner_result.thinking,
-                    "thinking_tokens": planner_result.thinking_tokens,
-                },
-            )
-        runtime.display.set_panel_text(
-            "PLANNER",
-            json.dumps(
-                {
-                    "thinking": planner_result.thinking,
-                    "thinking_tokens": planner_result.thinking_tokens,
-                    "output": planner_step.model_dump(),
-                },
-                indent=2,
-                ensure_ascii=False,
-            ),
+        planner_step = result.content
+        runtime.events.log(
+            "planner_step",
+            planner_step.model_dump(),
+            step_id=planner_step.step_id,
+            agent="planner",
+            stage="plan",
         )
-        history = runtime.history
-        state["history"] = history
-        history.append(
-            StepRecord(
-                step_id=planner_step.step_id,
-                planner_step=planner_step,
-                planner_thinking=planner_result.thinking,
-                planner_thinking_tokens=planner_result.thinking_tokens,
-            )
+        runtime.display.set_panel_text("PLANNER", json.dumps(planner_step.model_dump(), ensure_ascii=False, indent=2))
+        record = StepRecord(
+            step_id=planner_step.step_id,
+            planner_step=planner_step,
+            notes_snapshot=list(notes),
+            draft_answer=draft,
+            candidate_signatures=[],
         )
-        state["step_counter"] = step_id
+        runtime.history.append(record)
         state["planner_step"] = planner_step
+        state["retry_step"] = False
         state["candidates"] = []
-        state["judge_candidates"] = []
         state["chosen_action"] = None
-        state["needs_judge"] = False
-        state["retrying"] = False
-        _update_metrics(runtime, state.get("steps_completed", 0))
+        state["votes"] = {}
+        state["judge_needed"] = False
         return state
 
     return _node
 
 
-def voters_node(config: SwarmConfig):
-    def _node(state: GraphState) -> GraphState:
-        runtime = state["runtime"]
+def propose_node(config: SwarmConfig):
+    async def _node(state: GraphState) -> GraphState:
         planner_step = state.get("planner_step")
         if not planner_step:
             state["abort_reason"] = "planner missing"
-            runtime.display.log_event("Planner output missing.")
             return state
-        if _budget_exhausted(runtime):
-            state["abort_reason"] = "token budget exceeded"
-            runtime.events.log("abort", {"reason": state["abort_reason"]})
-            runtime.display.log_event("Budget exceeded, stopping.")
-            state["done"] = True
-            return state
+        runtime = state["runtime"]
         actions: List[Action] = []
+        votes: Dict[str, int] = {}
+        lock = asyncio.Lock()
+        stop_event = asyncio.Event()
         style_pool = [
-            "Explore alternative ideas.",
-            "Focus on execution details.",
-            "Check constraints and blockers.",
-            "Draft candidate final answers.",
-            "Plan follow-up analysis.",
+            "check arithmetic carefully",
+            "summarize existing notes",
+            "compare competing ideas",
+            "draft the final answer",
+            "highlight missing info",
         ]
-        voter_thinking: Dict[int, Optional[str]] = {}
-        voter_thinking_tokens: Dict[int, Optional[int]] = {}
-        worker_token_cap = max(16, min(planner_step.worker_max_tokens, runtime.config.max_total_tokens))
-        for idx in range(1, config.swarm_size + 1):
+
+        async def run_worker(idx: int) -> None:
+            if stop_event.is_set():
+                return
             stage = f"VOTER#{idx}" if idx <= runtime.display.visible_voters else "VOTERS(+extra)"
+            rand = random.Random(config.seed_base + idx)
+            style = style_pool[rand.randrange(len(style_pool))]
             meta = AgentCallMeta(agent=f"voter_{idx}", stage=stage, step_id=planner_step.step_id, voter_id=idx)
-            style_hint = style_pool[random.Random(config.seed_base + idx).randrange(len(style_pool))]
-            voter_messages = _voter_prompt(
-                state["task"],
-                planner_step,
-                idx,
-                config.show_rationale,
-                style_hint,
+            prompt = _voter_prompt(
+                task=state["task"],
+                planner_step=planner_step,
+                notes=state.get("notes", []),
+                draft=state.get("draft_answer"),
+                voter_index=idx,
+                style_hint=style,
+                show_rationale=config.show_rationale,
             )
+
             try:
-                action_result = _request_json(
-                    runtime.llm,
-                    voter_messages,
+                result = await asyncio.to_thread(
+                    runtime.llm.structured_completion,
+                    prompt,
                     meta=meta,
                     model=config.model_worker,
                     temperature=config.temperature_worker,
+                    schema_name="Action",
+                    schema=Action.model_json_schema(),
                     parser=Action.model_validate,
-                    output_schema=Action.model_json_schema(),
-                    runtime=runtime,
-                    max_output_tokens=worker_token_cap,
+                    max_output_tokens=planner_step.worker_max_tokens,
                 )
-            except Exception as err:
+            except Exception as err:  # pragma: no cover - network
                 runtime.metrics.increment_retry()
+                runtime.display.set_panel_text(stage, f"Worker error: {err}")
                 runtime.events.log(
-                    "worker_failed",
-                    {
-                        "voter_id": idx,
-                        "step_id": planner_step.step_id,
-                        "error": str(err),
-                    },
+                    "worker_error",
+                    {"error": str(err)},
+                    step_id=planner_step.step_id,
+                    agent=meta.agent,
+                    stage=stage,
                 )
-                runtime.display.set_panel_text(stage, f"Worker failed after retries: {err}")
-                continue
-            action = action_result.content
-            runtime.display.set_panel_text(
-                stage,
-                json.dumps(
-                    {
-                        "thinking": action_result.thinking,
-                        "thinking_tokens": action_result.thinking_tokens,
-                        "output": action.model_dump(),
-                    },
-                    indent=2,
-                    ensure_ascii=False,
-                ),
-            )
-            if action_result.thinking is not None:
-                voter_thinking[idx] = action_result.thinking
-            if action_result.thinking_tokens is not None:
-                voter_thinking_tokens[idx] = action_result.thinking_tokens
-            actions.append(action)
-        runtime.events.log("voter_batch", {"count": len(actions), "step_id": planner_step.step_id})
-        state["candidates"] = actions
-        _update_history(
-            state,
-            candidates_signatures=[action.signature for action in actions],
-            voter_thinking=voter_thinking or {},
-            voter_thinking_tokens=voter_thinking_tokens or {},
+                return
+            action = result.content
+            runtime.display.set_panel_text(stage, json.dumps(action.model_dump(), ensure_ascii=False, indent=2))
+            async with lock:
+                actions.append(action)
+                votes[action.signature] = votes.get(action.signature, 0) + 1
+                leader = runtime.consensus.leader_if_ahead(votes)
+                if leader and not stop_event.is_set():
+                    runtime.display.log_event(f"Early consensus on {leader}")
+                    stop_event.set()
+
+        tasks = [asyncio.create_task(run_worker(idx)) for idx in range(1, config.swarm_size + 1)]
+        pending = set(tasks)
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            if stop_event.is_set():
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                break
+        await asyncio.gather(*tasks, return_exceptions=True)
+        runtime.metrics.add_votes(sum(votes.values()))
+        runtime.display.set_panel_text("AGGREGATE", json.dumps({"votes": votes}, ensure_ascii=False))
+        runtime.events.log(
+            "voter_batch",
+            {"count": len(actions), "votes": votes},
+            step_id=planner_step.step_id,
+            stage="propose",
         )
+        state["candidates"] = actions
+        state["votes"] = votes
+        _update_history(state, candidate_signatures=[a.signature for a in actions])
         return state
 
     return _node
 
 
-def consensus_node():
+def aggregate_node(config: SwarmConfig):
     def _node(state: GraphState) -> GraphState:
+        planner_step = state.get("planner_step")
         runtime = state["runtime"]
         actions = state.get("candidates", [])
+        if not planner_step or not actions:
+            state["retry_step"] = True
+            runtime.display.log_event("No worker actions; re-planning.")
+            return state
         result = runtime.consensus.decide(actions)
-        runtime.metrics.add_votes(sum(result.votes.values()))
-        signatures = list(result.votes.items())
-        runtime.events.log("consensus", {"votes": signatures})
-        runtime.display.log_event(f"Consensus votes: {signatures}")
-        state["needs_judge"] = result.needs_judge
-        state["judge_candidates"] = result.top_candidates
+        runtime.display.log_event(f"Votes: {result.votes}")
+        runtime.events.log(
+            "consensus",
+            {"votes": result.votes},
+            step_id=planner_step.step_id,
+            stage="consensus",
+        )
+        state["votes"] = result.votes
         if result.needs_judge:
-            runtime.display.set_panel_text("JUDGE", "Awaiting decision between top candidates.")
-        else:
-            runtime.display.set_panel_text("JUDGE", "Consensus reached without judge.")
-        if not result.needs_judge:
-            state["chosen_action"] = result.selected
+            selection = _call_judge(state, result.top_candidates, config)
+            if not selection:
+                runtime.display.log_event("Judge deferred decision; re-planning.")
+                state["retry_step"] = True
+                return state
+            signature = selection.get("selected_signature") if isinstance(selection, dict) else None
+            if signature in ("1", "2"):
+                state["retry_step"] = True
+                runtime.display.log_event("Judge returned index not signature -> retrying.")
+                return state
+            if not isinstance(signature, str):
+                runtime.display.log_event("Judge returned invalid payload; re-planning.")
+                state["retry_step"] = True
+                return state
+            if signature == "none":
+                runtime.display.log_event("Judge rejected all candidates; re-planning.")
+                state["retry_step"] = True
+                return state
+            chosen_action = next((c for c in result.top_candidates if c.signature == signature), None)
+            if not chosen_action:
+                runtime.display.log_event("Judge chose unknown signature; re-planning.")
+                state["retry_step"] = True
+                return state
+            state["chosen_action"] = chosen_action
+            state["judge_needed"] = True
+            state["retry_step"] = False
+            runtime.display.set_panel_text(
+                "JUDGE",
+                json.dumps({"selected_signature": signature}, ensure_ascii=False, indent=2),
+            )
+            runtime.events.log(
+                "judge_choice",
+                {"selected_signature": signature},
+                step_id=planner_step.step_id,
+                stage="judge",
+                signature=signature,
+            )
+            _update_history(
+                state,
+                chosen_signature=signature,
+                judge_used=True,
+            )
+            return state
+        if result.selected is None:
+            runtime.display.log_event("Consensus produced no winner; re-planning.")
+            state["retry_step"] = True
+            return state
+        state["chosen_action"] = result.selected
+        state["judge_needed"] = False
+        state["retry_step"] = False
+        _update_history(state, chosen_signature=result.selected.signature)
         return state
 
     return _node
 
 
-def judge_node(config: SwarmConfig):
-    def _node(state: GraphState) -> GraphState:
-        runtime = state["runtime"]
-        if _budget_exhausted(runtime):
-            state["abort_reason"] = "token budget exceeded"
-            runtime.events.log("abort", {"reason": state["abort_reason"]})
-            runtime.display.log_event("Budget exceeded before judge call.")
-            state["done"] = True
-            return state
-        candidates = state.get("judge_candidates", [])
-        planner_step = state.get("planner_step")
-        if not candidates or not planner_step:
-            state["retrying"] = True
-            return state
-        content = json.dumps([c.model_dump() for c in candidates], ensure_ascii=False, indent=2)
-        wrapper_hint = _structured_wrapper_instructions("JudgeSelection", include_example=False)
-        messages = [
-            SystemMessage(
-                content="You are the SwarmMaker judge. Choose the better JSON action and wrap it in the structured schema.\n"
-                f"{wrapper_hint}\n"
-                'Your `output` object must look like {"selected_signature": "<signature-or-none>"} where selecting "none" requests another vote.'
-            ),
-            HumanMessage(
-                content=(
-                    f"Planner step: {planner_step.step_goal}\n"
-                    f"Candidates:\n{content}\n"
-                    "Remember: respond with raw JSON only; do NOT wrap in markdown."
-                )
-            ),
-        ]
-        meta = AgentCallMeta(agent="judge", stage="JUDGE", step_id=planner_step.step_id)
-        judge_schema = {
-            "type": "object",
-            "properties": {
-                "selected_signature": {
-                    "type": "string",
-                    "description": "Signature of the chosen action, or the literal string \"none\" to request another vote.",
-                }
-            },
-            "required": ["selected_signature"],
-            "additionalProperties": False,
-        }
-        response = _request_json(
-            runtime.llm,
+def _call_judge(state: GraphState, candidates: Sequence[Action], config: SwarmConfig) -> Optional[Dict[str, str]]:
+    runtime = state["runtime"]
+    planner_step = state.get("planner_step")
+    if not planner_step:
+        return None
+    content = json.dumps(
+        [
+            {
+                "signature": candidate.signature,
+                "action": candidate.model_dump(mode="json"),
+            }
+            for candidate in candidates
+        ],
+        ensure_ascii=False,
+        indent=2,
+    )
+    messages = [
+        SystemMessage(
+            content=(
+                "You are the SwarmMaker judge.\n"
+                "Choose exactly ONE of the candidate actions as the best next action.\n"
+                "Return ONLY valid JSON with this schema:\n"
+                '{ "selected_signature": "<exact candidate signature string>" }\n'
+                'OR if both are disqualified: { "selected_signature": "none" }\n'
+                "Important: selected_signature MUST match one of the provided candidate signatures exactly."
+            )
+        ),
+        HumanMessage(
+            content=(
+                f"Planner step goal: {planner_step.step_goal}\n"
+                "Candidates (each has an implicit signature = canonical JSON of action_type+args):\n"
+                f"{content}\n"
+            )
+        ),
+    ]
+    meta = AgentCallMeta(agent="judge", stage="JUDGE", step_id=planner_step.step_id)
+    judge_schema = {
+        "type": "object",
+        "properties": {"selected_signature": {"type": "string"}},
+        "required": ["selected_signature"],
+        "additionalProperties": False,
+    }
+    try:
+        result = runtime.llm.structured_completion(
             messages,
             meta=meta,
             model=config.model_judge,
             temperature=config.temperature_judge,
-            parser=lambda payload: payload,
-            output_schema=judge_schema,
-            runtime=runtime,
+            schema_name="JudgeSelection",
+            schema=judge_schema,
+            parser=lambda data: data,
         )
-        selection = response.content
-        signature = selection.get("selected_signature") if isinstance(selection, dict) else None
-        if response.thinking or response.thinking_tokens is not None:
-            runtime.events.log(
-                "judge_thinking",
-                {"thinking": response.thinking, "thinking_tokens": response.thinking_tokens},
-            )
-        if signature == "none":
-            runtime.metrics.increment_retry()
-            runtime.events.log("judge_none", {"step_id": planner_step.step_id})
-            runtime.display.log_event("Judge rejected both candidates; retrying voters.")
-            runtime.display.set_panel_text("JUDGE", "No selection; requesting new votes.")
-            state["retrying"] = True
-            state["chosen_action"] = None
-            _update_history(
-                state,
-                judge_thinking=response.thinking,
-                judge_thinking_tokens=response.thinking_tokens,
-            )
-            return state
-        state["retrying"] = False
-        selected = next((c for c in candidates if c.signature == signature), None)
-        if not selected:
-            runtime.display.log_event("Judge selected unknown signature, retrying.")
-            state["retrying"] = True
-            runtime.metrics.increment_retry()
-            return state
-        state["chosen_action"] = selected
-        runtime.display.set_panel_text(
-            "JUDGE",
-            json.dumps(
-                {
-                    "thinking": response.thinking,
-                    "thinking_tokens": response.thinking_tokens,
-                    "output": {"selected_signature": selected.signature},
-                },
-                indent=2,
-                ensure_ascii=False,
-            ),
+        return result.content
+    except Exception as err:  # pragma: no cover - network
+        runtime.display.log_event(f"Judge failed: {err}")
+        runtime.events.log(
+            "judge_error",
+            {"error": str(err)},
+            step_id=planner_step.step_id,
+            stage="judge",
         )
-        _update_history(
-            state,
-            judge_used=True,
-            chosen_signature=selected.signature,
-            judge_thinking=response.thinking,
-            judge_thinking_tokens=response.thinking_tokens,
-        )
-        return state
-
-    return _node
+        return None
 
 
-def verify_node(config: SwarmConfig):
+def verify_apply_node(config: SwarmConfig):
     def _node(state: GraphState) -> GraphState:
         runtime = state["runtime"]
         planner_step = state.get("planner_step")
-        chosen = state.get("chosen_action")
-        if not planner_step or not chosen:
-            state["retrying"] = True
-            runtime.metrics.increment_retry()
-            runtime.events.log("verify_missing", {"step": planner_step.step_id if planner_step else None})
-            runtime.display.log_event("Verifier missing action; retrying voters.")
-            _increment_history_retry(state)
-            last_record = _last_record(state)
-            current_retries = last_record.retries if last_record else 0
-            if current_retries >= config.max_retries:
-                state["retrying"] = False
+        action = state.get("chosen_action")
+        if state.get("abort_reason"):
+            return state
+        if not planner_step or not action:
+            state["retry_step"] = True
+            runtime.display.log_event("Missing action; starting new plan.")
+            retries = _increment_retries(state)
+            if retries >= config.max_retries:
                 state["abort_reason"] = "max retries reached"
-                runtime.events.log("abort", {"reason": state["abort_reason"]})
-                runtime.display.log_event("Max retries reached; aborting.")
                 state["done"] = True
             return state
-        ok, reason = runtime.verifier.verify(
-            planner_step,
-            chosen,
-            dry_run=config.dry_run,
-        )
+        ok, reason = runtime.verifier.verify(planner_step, action)
         if not ok:
-            runtime.metrics.increment_retry()
-            runtime.events.log("verify_fail", {"reason": reason})
+            runtime.events.log(
+                "verify_reject",
+                {"reason": reason, "action": action.model_dump()},
+                step_id=planner_step.step_id,
+                stage="verify",
+                signature=action.signature,
+            )
             runtime.display.log_event(f"Verifier rejected action: {reason}")
-            state["retrying"] = True
-            _increment_history_retry(state)
-            last_record = _last_record(state)
-            current_retries = last_record.retries if last_record else 0
-            if current_retries >= config.max_retries:
-                state["retrying"] = False
+            state["retry_step"] = True
+            retries = _increment_retries(state)
+            if retries >= config.max_retries:
                 state["abort_reason"] = "max retries reached"
-                runtime.events.log("abort", {"reason": state["abort_reason"]})
-                runtime.display.log_event("Max retries reached; aborting.")
                 state["done"] = True
             return state
-        runtime.events.log("action_applied", {"signature": chosen.signature})
-        runtime.display.log_event(f"Action applied: {chosen.signature}")
-        runtime.display.set_panel_text("VERIFIER", f"Accepted {chosen.signature}")
-        _update_history(state, chosen_signature=chosen.signature, verifier_passed=True)
-        state["steps_completed"] = state.get("steps_completed", 0) + 1
-        state["retrying"] = False
-        state["done"] = planner_step.stop_condition == "done" or chosen.action_type == "final_answer"
-        if chosen.action_type == "final_answer":
-            state["final_answer"] = str(chosen.args.get("content") or chosen.args)
-        _update_metrics(runtime, state.get("steps_completed", 0))
+        runtime.verifier.apply(action, state)
+        runtime.events.log(
+            "action_applied",
+            action.model_dump(),
+            step_id=planner_step.step_id,
+            stage="verify",
+            signature=action.signature,
+        )
+        runtime.display.set_panel_text("VERIFIER", json.dumps(action.model_dump(), ensure_ascii=False, indent=2))
+        _update_history(state, verifier_passed=True, final_answer=state.get("final_answer"))
+        state["retry_step"] = False
+        state["planner_step"] = None
+        steps_completed = state.get("steps_completed", 0) + 1
+        state["steps_completed"] = steps_completed
+        runtime.display.update_metrics(
+            runtime.metrics.snapshot(
+                steps_completed,
+                budget_remaining=max(config.max_total_tokens - runtime.metrics.tokens_total(), 0),
+            )
+        )
+        if action.action_type == "FINAL":
+            state["final_answer"] = state.get("final_answer") or state.get("draft_answer")
+            state["done"] = True
+        else:
+            state["done"] = False
         return state
 
     return _node
 
 
-def verify_router(state: GraphState) -> str:
-    if state.get("abort_reason"):
+def _verify_router(state: GraphState) -> str:
+    if state.get("abort_reason") or state.get("done"):
         return "final"
-    if state.get("done"):
-        return "final"
-    if state.get("retrying"):
-        return "voters"
-    return "planner"
+    return "check"
 
 
 def final_node():
     def _node(state: GraphState) -> GraphState:
         runtime = state["runtime"]
-        final_answer = state.get("final_answer") or "No final answer."
+        final_answer = state.get("final_answer") or state.get("draft_answer") or "No final answer."
         runtime.display.set_panel_text("FINAL", final_answer)
-        runtime.display.log_event("Finalized run.")
+        runtime.display.log_event("Run finished.")
+        runtime.events.log("final", {"final_answer": final_answer})
         runtime.langsmith.complete(outputs={"final_answer": final_answer}, error=state.get("abort_reason"))
         return state
 
     return _node
 
 
-def _last_record(state: GraphState) -> Optional[StepRecord]:
-    history = state.get("history") or []
-    return history[-1] if history else None
-
-
-def _update_history(state: GraphState, **updates) -> None:
-    history = state.get("history") or []
-    if not history:
-        return
-    last = history[-1]
-    history[-1] = last.model_copy(update=updates)
-
-
-def _increment_history_retry(state: GraphState) -> None:
-    history = state.get("history") or []
-    if not history:
-        return
-    last = history[-1]
-    retries = last.retries + 1
-    history[-1] = last.model_copy(update={"retries": retries})
-
-
-def _update_metrics(runtime: RuntimeContext, steps: int) -> None:
-    budget_remaining = max(
-        runtime.config.max_total_tokens - runtime.metrics.tokens_total(),
-        0,
-    )
-    snapshot = runtime.metrics.snapshot(steps, budget_remaining=budget_remaining)
-    runtime.display.update_metrics(snapshot)
-
-
-def _budget_exhausted(runtime: RuntimeContext) -> bool:
-    return runtime.metrics.tokens_total() >= runtime.config.max_total_tokens
-
-
-def _extract_json_payload(text: str) -> str:
-    """Best-effort extraction of JSON body by removing fences and headers."""
-
-    stripped = text.strip()
-    if not stripped:
-        return stripped
-    # Remove stray provider control tokens.
-    for token in ("<|fim_middle|>", "<|fim_end|>", "<|assistant|>", "<|user|>"):
-        stripped = stripped.replace(token, "")
-    if stripped.startswith("```"):
-        lines = stripped.splitlines()
-        if lines:
-            lines = lines[1:]  # drop opening fence
-        while lines and lines[-1].strip().startswith("```"):
-            lines = lines[:-1]
-        stripped = "\n".join(lines).strip()
-    if stripped.startswith("{") or stripped.startswith("["):
-        candidate = _slice_first_json_blob(stripped)
-        if candidate:
-            return candidate
-    candidate = _slice_first_json_blob(stripped)
-    return candidate or stripped
-
-
-def _slice_first_json_blob(text: str) -> Optional[str]:
-    """Return first balanced JSON object/array substring if possible."""
-
-    stack: List[str] = []
-    start: Optional[int] = None
-    in_string = False
-    escape = False
-
-    for idx, ch in enumerate(text):
-        if start is None:
-            if ch in ("{", "["):
-                start = idx
-                stack.append("}" if ch == "{" else "]")
-            continue
-        if not stack:
-            break
-        if escape:
-            escape = False
-            continue
-        if ch == "\\" and in_string:
-            escape = True
-            continue
-        prev_char = text[idx - 1] if idx > 0 else ""
-        if ch == '"' and prev_char != "\\":
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        expected = stack[-1]
-        if ch == expected:
-            stack.pop()
-            if not stack:
-                return text[start : idx + 1].strip()
-        elif ch in ("{", "["):
-            stack.append("}" if ch == "{" else "]")
-    return None
-
-
-def _extract_missing_fields(err: ValidationError) -> List[str]:
-    fields: List[str] = []
-    for detail in err.errors():
-        if detail.get("type") == "missing":
-            loc = detail.get("loc")
-            if not loc:
-                continue
-            name = ".".join(str(part) for part in loc)
-            fields.append(name)
-    return fields
-
-
-def _structured_wrapper_instructions(schema_name: str, *, include_example: bool = True) -> str:
-    """Shared hint describing the enforced structured output wrapper."""
-
-    hint = (
-        "Return ONLY valid JSON, no prose or markdown fences.\n"
-        "Your response MUST be a JSON object with keys `thinking` (string, optional), "
-        "`thinking_tokens` (integer, optional), and `output` (object). "
-        f"The `output` object MUST strictly match the {schema_name} schema with valid JSON."
-    )
-    if include_example:
-        example = {
-            "thinking": "short hidden reasoning",
-            "thinking_tokens": 24,
-            "output": {
-                "placeholder": "replace with schema-compliant fields"
-            },
-        }
-        hint += f" Example: {json.dumps(example, ensure_ascii=False)}."
-    hint += " No extra keys, markdown fences, or commentary are allowed."
-    return hint
-
-
-def _build_structured_schema(output_schema: Dict[str, Any]) -> Dict[str, Any]:
-    """Return JSON schema for StructuredLLMOutput with injected output schema."""
-
-    return {
-        "type": "object",
-        "properties": {
-            "thinking": {
-                "type": "string",
-                "description": "Optional hidden reasoning.",
-            },
-            "thinking_tokens": {
-                "type": "integer",
-                "minimum": 0,
-                "description": "Token count spent inside thinking.",
-            },
-            "output": output_schema,
-        },
-        "required": ["output"],
-        "additionalProperties": False,
+def run_swarm(*, task: str, config: SwarmConfig, runtime: RuntimeContext) -> RunResult:
+    graph = build_graph(config)
+    initial_state: GraphState = {
+        "task": task,
+        "runtime": runtime,
+        "notes": [],
+        "draft_answer": None,
+        "history_signatures": [],
+        "history": runtime.history,
+        "steps_completed": 0,
+        "done": False,
+        "retry_step": False,
     }
+    compiled = graph.compile()
+    final_state = asyncio.run(compiled.ainvoke(initial_state))
+    stats_snapshot = runtime.metrics.snapshot(final_state.get("steps_completed", 0))
+    run_stats = RunStats(
+        elapsed_s=stats_snapshot.get("elapsed", 0.0),
+        llm_calls=runtime.metrics.llm_calls,
+        tokens_in=runtime.metrics.tokens_in,
+        tokens_out=runtime.metrics.tokens_out,
+        retries=runtime.metrics.retries,
+        consensus_votes=runtime.metrics.consensus_votes,
+        aborted_reason=final_state.get("abort_reason"),
+    )
+    artifacts = RunArtifacts(
+        langsmith_run_url=runtime.langsmith.run_url,
+    )
+    return RunResult(
+        task=task,
+        final_answer=final_state.get("final_answer") or final_state.get("draft_answer"),
+        steps=list(runtime.history),
+        stats=run_stats,
+        artifacts=artifacts,
+    )
 
 
-def _structured_response_format(meta: AgentCallMeta, schema: Dict[str, Any]) -> Dict[str, Any]:
-    """Return OpenAI response_format payload for strict schema enforcement."""
-
-    schema_name = _sanitize_schema_name(meta)
-    return {
-        "type": "json_schema",
-        "json_schema": {
-            "name": schema_name,
-            "schema": schema,
-            "strict": True,
-        },
-    }
-
-
-def _sanitize_schema_name(meta: AgentCallMeta) -> str:
-    candidate = f"{meta.agent}_{meta.stage}_schema"
-    sanitized = re.sub(r"[^A-Za-z0-9_]", "_", candidate)
-    sanitized = sanitized.strip("_")[:64]
-    return sanitized or "SwarmMakerSchema"
-
-
-TParsed = TypeVar("TParsed")
-
-
-def _request_json(
-    llm: LLMClient,
-    messages: Sequence,
+def _voter_prompt(
     *,
-    meta: AgentCallMeta,
-    model: str,
-    temperature: float,
-    parser: Callable[[Any], TParsed],
-    output_schema: Dict[str, Any],
-    runtime: RuntimeContext,
-    max_output_tokens: Optional[int] = None,
-) -> StructuredParseResult[TParsed]:
-    attempts = 2
-    wrapper_schema = _build_structured_schema(output_schema)
-    schema_directive = SystemMessage(
-        content=(
-            "STRICT JSON SCHEMA (respond with JSON only, beginning with `{`):\n"
-            f"{json.dumps(wrapper_schema, ensure_ascii=False, indent=2)}"
-        )
-    )
-    response_format = _structured_response_format(meta, wrapper_schema)
-    base_messages = [schema_directive, *messages]
-    prompt_messages = list(base_messages)
-    for attempt in range(attempts):
-        try:
-            text = llm.complete(
-                prompt_messages,
-                meta=meta,
-                model=model,
-                temperature=temperature,
-                response_format=response_format,
-                max_output_tokens=max_output_tokens,
-            )
-        except Exception as err:
-            runtime.metrics.increment_retry()
-            runtime.events.log(
-                "llm_call_error",
-                {
-                    "agent": meta.agent,
-                    "stage": meta.stage,
-                    "error": str(err),
-                },
-            )
-            if attempt == attempts - 1:
-                raise
-            runtime.display.log_event(f"LLM error from {meta.agent}: {err}. Retrying.")
-            prompt_messages = list(base_messages)
-            continue
-        try:
-            payload = _extract_json_payload(text)
-            structured = StructuredLLMOutput.model_validate_json(payload)
-            parsed = parser(structured.output)
-            return StructuredParseResult(
-                content=parsed,
-                thinking=structured.thinking,
-                thinking_tokens=structured.thinking_tokens,
-            )
-        except (json.JSONDecodeError, ValidationError, TypeError, ValueError) as err:
-            runtime.metrics.increment_retry()
-            correction_hint = "Previous output was invalid. Reply with ONLY valid JSON following the structured schema with `thinking`, `thinking_tokens`, and `output` keys."
-            if isinstance(err, ValidationError):
-                missing_fields = _extract_missing_fields(err)
-                if missing_fields:
-                    correction_hint = (
-                        "Previous output was invalid because these fields were missing or malformed: "
-                        f"{', '.join(sorted(set(missing_fields)))}. "
-                        "Return valid JSON with all required fields populated (e.g., include `output.step_id`)."
-                    )
-            runtime.events.log(
-                "json_parse_error",
-                {
-                    "agent": meta.agent,
-                    "stage": meta.stage,
-                    "error": str(err),
-                    "snippet": text[:200],
-                },
-            )
-            if attempt == attempts - 1:
-                raise
-            runtime.display.log_event(f"Invalid JSON from {meta.agent}, retrying.")
-            prompt_messages = list(base_messages) + [
-                HumanMessage(content=correction_hint)
-            ]
-    raise RuntimeError("JSON parsing failed")
-
-
-def _voter_prompt(task: str, planner_step: PlannerStep, voter_index: int, show_rationale: bool, style_hint: str):
-    rationale_instruction = (
-        "Include a short rationale sentence." if show_rationale else "Omit the rationale field."
-    )
-    wrapper_hint = _structured_wrapper_instructions("Action")
-    messages = [
+    task: str,
+    planner_step: PlannerStep,
+    notes: Sequence[str],
+    draft: Optional[str],
+    voter_index: int,
+    style_hint: str,
+    show_rationale: bool,
+) -> List[Any]:
+    rationale_instruction = "Include rationale (<=1 sentence)." if show_rationale else "Do not include rationale."
+    recent_notes = json.dumps(list(notes)[-5:], ensure_ascii=False)
+    draft_answer = json.dumps(draft, ensure_ascii=False)
+    return [
         SystemMessage(
             content=(
-                f"You are SwarmMaker worker #{voter_index}. Propose a single actionable JSON Action.\n"
-                "Fields: step_id, action_type, args (object), optional rationale (<=1 sentence), confidence (0-1). "
-                "Use the exact field names shown; do not invent alternatives like `confident`.\n"
-                f"{wrapper_hint} Put any private reasoning inside `thinking`."
+                f"You are SwarmMaker worker #{voter_index}.\n"
+                "You MUST output ONLY valid JSON matching the Action schema.\n"
+                'Action schema:\n{ "step_id": int, "action_type": "FINAL"|"NOTE"|"ASK_CLARIFY"|"DO", "args": object'
+                + (', "rationale": string' if show_rationale else "")
+                + ', "confidence": number }\n'
+                "Rules:\n"
+                f"- step_id MUST equal {planner_step.step_id} exactly.\n"
+                "- If stop_condition is 'done' OR step_goal asks for final answer: output action_type='FINAL' "
+                'with args={"content": <final answer string>}.\n'
+                "- Otherwise:\n"
+                '  NOTE: args may be empty or include {"content": "..."}\n'
+                '  ASK_CLARIFY: args={"prompt":"..."}\n'
+                "  DO: args must be non-empty\n"
+                f"- {rationale_instruction}\n"
+                "- No markdown, no extra keys."
             )
         ),
         HumanMessage(
@@ -883,55 +649,27 @@ def _voter_prompt(task: str, planner_step: PlannerStep, voter_index: int, show_r
                 f"Task: {task}\n"
                 f"Step goal: {planner_step.step_goal}\n"
                 f"Stop condition: {planner_step.stop_condition}\n"
-                f"Planner token cap per worker: {planner_step.worker_max_tokens} completion tokens (hard limit).\n"
+                f"Recent notes: {recent_notes}\n"
+                f"Draft answer: {draft_answer}\n"
                 f"Style hint: {style_hint}\n"
-                f"{rationale_instruction}\n"
-                f"Set `output.step_id` to {planner_step.step_id} exactly. "
-                "Place all required keys even if obvious. Respond with valid JSON only."
             )
         ),
     ]
-    return messages
 
 
-def run_swarm(
-    *,
-    task: str,
-    config: SwarmConfig,
-    runtime: RuntimeContext,
-) -> RunResult:
-    graph = build_graph(config)
-    history_holder = runtime.history
-    initial_state: GraphState = {
-        "task": task,
-        "config": config,
-        "runtime": runtime,
-        "history": history_holder,
-        "steps_completed": 0,
-        "step_counter": 0,
-        "done": False,
-    }
-    compiled = graph.compile()
-    final_state = compiled.invoke(initial_state)
-    stats = runtime.metrics
-    snapshot = stats.snapshot(final_state.get("steps_completed", 0))
-    run_stats = RunStats(
-        elapsed_s=snapshot.get("elapsed", 0.0),
-        llm_calls=stats.llm_calls,
-        tokens_in=stats.tokens_in,
-        tokens_out=stats.tokens_out,
-        retries=stats.retries,
-        consensus_votes=stats.consensus_votes,
-        aborted_reason=final_state.get("abort_reason"),
-    )
-    artifacts = RunArtifacts(
-        langsmith_run_url=runtime.langsmith.run_url,
-    )
-    result = RunResult(
-        task=task,
-        final_answer=final_state.get("final_answer"),
-        steps=list(history_holder),
-        stats=run_stats,
-        artifacts=artifacts,
-    )
-    return result
+def _increment_retries(state: GraphState) -> int:
+    history = state.get("history")
+    if not history:
+        return 0
+    last = history[-1]
+    updated = last.retries + 1
+    history[-1] = last.model_copy(update={"retries": updated})
+    return updated
+
+
+def _update_history(state: GraphState, **updates: Any) -> None:
+    history = state.get("history")
+    if not history:
+        return
+    last = history[-1]
+    history[-1] = last.model_copy(update=updates)

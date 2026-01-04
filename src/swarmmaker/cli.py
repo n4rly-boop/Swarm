@@ -14,7 +14,14 @@ from .config import settings
 from .graph import LangSmithManager, RuntimeContext, run_swarm
 from .io import EventLogger, ensure_log_dir, save_json_result, save_markdown_result
 from .llm import LLMClient, MetricsTracker
-from .schemas import RunArtifacts, RunResult, RunStats, SwarmConfig
+from .schemas import (
+    RunArtifacts,
+    RunResult,
+    RunStats,
+    StructuredMode,
+    SwarmConfig,
+    canonical_json,
+)
 from .verify import ActionVerifier
 
 app = typer.Typer(add_completion=False, help="SwarmMaker multi-agent CLI.")
@@ -32,18 +39,24 @@ def main(
     model_judge: str = typer.Option(DEFAULT_JUDGE_MODEL, "--model-judge", show_default=True),
     swarm_size: int = typer.Option(5, "--swarm-size"),
     ahead_by: int = typer.Option(2, "--ahead-by", help="Early stop K votes ahead."),
-    max_steps: int = typer.Option(20, "--max-steps"),
-    max_retries: int = typer.Option(3, "--max-retries"),
+    max_steps: int = typer.Option(12, "--max-steps"),
+    max_retries: int = typer.Option(2, "--max-retries"),
     max_total_tokens: int = typer.Option(20_000, "--max-total-tokens"),
-    max_cost_usd: Optional[float] = typer.Option(None, "--max-cost-usd"),
     max_wall_seconds: int = typer.Option(180, "--max-wall-seconds"),
     timeout_seconds: int = typer.Option(60, "--timeout-seconds"),
     temperature_planner: float = typer.Option(0.3, "--temperature-planner"),
     temperature_worker: float = typer.Option(0.8, "--temperature-worker"),
     temperature_judge: float = typer.Option(0.2, "--temperature-judge"),
-    seed_base: int = typer.Option(42, "--seed-base"),
-    show_rationale: bool = typer.Option(False, "--show-rationale"),
-    dry_run: bool = typer.Option(False, "--dry-run"),
+    seed_base: int = typer.Option(42, "--seed", "--seed-base", help="Seed for stochastic prompts.", show_default=True),
+    show_rationale: bool = typer.Option(False, "--show-rationale/--hide-rationale", show_default=True),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Generate deterministic mock outputs."),
+    structured_mode: StructuredMode = typer.Option(
+        StructuredMode.json_schema,
+        "--structured-mode",
+        case_sensitive=False,
+        help="Provider response_format enforcement mode.",
+    ),
+    stream: bool = typer.Option(True, "--stream/--no-stream", show_default=True),
     log_dir: Optional[Path] = typer.Option(
         None, "--log-dir", help="Directory for logs (defaults to runs/<timestamp>)."
     ),
@@ -68,7 +81,6 @@ def main(
         max_steps=max_steps,
         max_retries=max_retries,
         max_total_tokens=max_total_tokens,
-        max_cost_usd=max_cost_usd,
         max_wall_seconds=max_wall_seconds,
         timeout_seconds=timeout_seconds,
         temperature_planner=temperature_planner,
@@ -77,8 +89,10 @@ def main(
         seed_base=seed_base,
         show_rationale=show_rationale,
         dry_run=dry_run,
+        stream=stream,
         log_dir=target_log_dir,
         project_name=project_name,
+        structured_mode=structured_mode,
     )
 
     openrouter_key = settings.get("OPENROUTER_API_KEY")
@@ -86,10 +100,12 @@ def main(
         typer.echo("OPENROUTER_API_KEY is required unless --dry-run is set.", err=True)
         raise typer.Exit(1)
 
-    display = LiveSwarmDisplay(config.swarm_size)
+    typer.echo(f"Configuration: {canonical_json(config.model_dump(mode='python'))}")
+
+    display = LiveSwarmDisplay(config.swarm_size, stream_enabled=config.stream)
     display.start()
     events = EventLogger(events_path)
-    events.log("task", {"task": task})
+    events.log("task", {"task": task}, message="task received")
     display.log_event(f"Logging to {target_log_dir}")
 
     metrics = MetricsTracker(config.max_total_tokens)
@@ -99,6 +115,8 @@ def main(
         timeout=config.timeout_seconds,
         display=display,
         metrics=metrics,
+        structured_mode=config.structured_mode,
+        stream=config.stream,
         dry_run=config.dry_run,
     )
     consensus = ConsensusEngine(config.ahead_by)
@@ -129,7 +147,7 @@ def main(
         )
     except KeyboardInterrupt:
         aborted_reason = "interrupted by user"
-        events.log("aborted", {"reason": aborted_reason})
+        events.log("aborted", {"reason": aborted_reason}, message=aborted_reason)
         display.log_event("Interrupted by user.")
         langsmith.complete(error=aborted_reason)
         run_stats = RunStats(
@@ -157,6 +175,7 @@ def main(
 
     result.artifacts.events_path = events_path
     result.artifacts.result_md_path = result_md_path
+    result.artifacts.result_json_path = result_json_path
     if not result.artifacts.langsmith_run_url:
         result.artifacts.langsmith_run_url = langsmith.run_url
 

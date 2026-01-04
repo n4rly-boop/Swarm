@@ -1,58 +1,79 @@
-"""Data models for SwarmMaker."""
+"""Data contracts and helpers for SwarmMaker."""
+import json
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Generic, List, Literal, Optional, TypeVar
 
 from pydantic import BaseModel, Field
 
 
+def canonical_json(obj: Any) -> str:
+    """Return the canonical serialized representation used across the system."""
+
+    def default(o: Any) -> Any:
+        if isinstance(o, Path):
+            return str(o)
+        raise TypeError(f"Object of type {o.__class__.__name__} is not JSON serializable")
+
+    return json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=default)
+
+
+class StructuredMode(str, Enum):
+    json_schema = "json_schema"
+    json_object = "json_object"
+
+
 class PlannerStep(BaseModel):
-    """Structured response from the planner agent."""
+    """Planner output describing the next worker goal."""
 
     step_id: int
-    step_goal: str = Field(min_length=1)
-    expected_action_schema: Literal["Action"] = "Action"
+    step_goal: str = Field(min_length=1, description="Concrete instruction for workers.")
     stop_condition: Literal["continue", "done"] = "continue"
     worker_max_tokens: int = Field(
         ge=16,
         le=2048,
-        description="Maximum completion tokens each worker may generate this step.",
+        description="Max completion tokens for each worker proposal.",
     )
 
 
+ActionType = Literal["FINAL", "NOTE", "ASK_CLARIFY", "DO"]
+
+
 class Action(BaseModel):
-    """Action proposed by a worker/voter."""
+    """Worker action proposal."""
 
     step_id: int
-    action_type: str
+    action_type: ActionType
     args: Dict[str, Any] = Field(default_factory=dict)
-    rationale: Optional[str] = None
+    rationale: Optional[str] = Field(
+        default=None,
+        max_length=280,
+        description="Optional single sentence rationale.",
+    )
     confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
 
     @property
     def signature(self) -> str:
-        # Signature used for consensus and loop prevention
-        args_repr = repr(sorted(self.args.items()))
-        return f"{self.step_id}:{self.action_type}:{args_repr}"
+        """Canonical signature used for deduping, logging, and consensus."""
+
+        return canonical_json({"action_type": self.action_type, "args": self.args})
 
 
 class StepRecord(BaseModel):
-    """History entry for a micro-step."""
+    """History entry shown in result artifacts."""
 
     step_id: int
     planner_step: PlannerStep
-    candidates_signatures: List[str] = Field(default_factory=list)
+    candidate_signatures: List[str] = Field(default_factory=list)
     chosen_signature: Optional[str] = None
     judge_used: bool = False
     retries: int = 0
     verifier_passed: bool = False
-    planner_thinking: Optional[str] = None
-    planner_thinking_tokens: Optional[int] = None
-    judge_thinking: Optional[str] = None
-    judge_thinking_tokens: Optional[int] = None
-    voter_thinking: Dict[int, Optional[str]] = Field(default_factory=dict)
-    voter_thinking_tokens: Dict[int, Optional[int]] = Field(default_factory=dict)
+    notes_snapshot: List[str] = Field(default_factory=list)
+    draft_answer: Optional[str] = None
+    final_answer: Optional[str] = None
 
 
 class RunStats(BaseModel):
@@ -67,6 +88,7 @@ class RunStats(BaseModel):
 
 class RunArtifacts(BaseModel):
     result_md_path: Optional[Path] = None
+    result_json_path: Optional[Path] = None
     events_path: Optional[Path] = None
     langsmith_run_url: Optional[str] = None
 
@@ -86,50 +108,23 @@ class SwarmConfig(BaseModel):
     model_planner: str
     model_worker: str
     model_judge: str
-    swarm_size: int = 5
+    swarm_size: int = 4
     ahead_by: int = 2
-    max_steps: int = 20
-    max_retries: int = 3
+    max_steps: int = 8
+    max_retries: int = 2
     max_total_tokens: int = 20_000
-    max_cost_usd: Optional[float] = None
     max_wall_seconds: int = 180
     timeout_seconds: int = 60
     temperature_planner: float = 0.3
-    temperature_worker: float = 0.8
+    temperature_worker: float = 0.5
     temperature_judge: float = 0.2
     seed_base: int = 42
     show_rationale: bool = False
     dry_run: bool = False
+    stream: bool = True
     log_dir: Path = Field(default_factory=lambda: Path("runs"))
     project_name: str = "swarmmaker-mvp"
-
-
-class StructuredLLMOutput(BaseModel):
-    """Wrapper schema forcing agents to separate thinking from final payload."""
-
-    thinking: Optional[str] = Field(
-        default=None,
-        description="Optional private reasoning or scratchpad tokens.",
-        max_length=10000,
-    )
-    thinking_tokens: Optional[int] = Field(
-        default=None,
-        ge=0,
-        description="Optional count of tokens spent inside `thinking`.",
-    )
-    output: Any = Field(description="Primary payload that must satisfy the caller schema.")
-
-
-T = TypeVar("T")
-
-
-@dataclass
-class StructuredParseResult(Generic[T]):
-    """Return type from `_request_json`, exposing parsed content and metadata."""
-
-    content: T
-    thinking: Optional[str]
-    thinking_tokens: Optional[int]
+    structured_mode: StructuredMode = StructuredMode.json_schema
 
 
 @dataclass
@@ -138,3 +133,25 @@ class AgentCallMeta:
     stage: str
     step_id: int
     voter_id: Optional[int] = None
+
+
+T = TypeVar("T")
+
+
+@dataclass
+class StructuredParseResult(Generic[T]):
+    """Return type for structured LLM responses."""
+
+    content: T
+    raw_text: str
+
+
+class SchemaValidationError(RuntimeError):
+    """Raised when provider violates the agreed schema."""
+
+    def __init__(self, *, agent: str, stage: str, payload: str, error: Exception):
+        super().__init__("Provider did not honor structured output")
+        self.agent = agent
+        self.stage = stage
+        self.payload = payload
+        self.error = error

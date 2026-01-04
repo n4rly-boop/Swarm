@@ -1,13 +1,22 @@
-"""LLM client wrapper for OpenRouter via LangChain."""
+"""LLM client wrapper with provider-level structured output."""
 import json
 import time
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Callable, Dict, Optional, Sequence, TypeVar
 
 from langchain_core.messages import BaseMessage
 from langchain_openai import ChatOpenAI
+from pydantic import ValidationError
 
 from .callbacks import LiveSwarmDisplay, StreamingCallbackHandler
-from .schemas import AgentCallMeta
+from .schemas import (
+    AgentCallMeta,
+    SchemaValidationError,
+    StructuredMode,
+    StructuredParseResult,
+)
+
+
+T = TypeVar("T")
 
 
 class MetricsTracker:
@@ -50,63 +59,119 @@ class MetricsTracker:
 
 
 class LLMClient:
-    """Thin wrapper over ChatOpenAI with Rich streaming hooks."""
+    """Thin wrapper over ChatOpenAI that always requests structured responses."""
 
     def __init__(
         self,
         *,
         api_key: Optional[str],
-        base_url: str,
+        base_url: Optional[str],
         timeout: int,
         display: LiveSwarmDisplay,
         metrics: MetricsTracker,
+        structured_mode: StructuredMode,
+        stream: bool,
         dry_run: bool = False,
     ) -> None:
         self.api_key = api_key
-        self.base_url = base_url
+        self.base_url = base_url or "https://openrouter.ai/api/v1"
         self.timeout = timeout
         self.display = display
         self.metrics = metrics
+        self.structured_mode = structured_mode
+        self.stream = stream
         self.dry_run = dry_run
 
-    def complete(
+    def structured_completion(
         self,
         messages: Sequence[BaseMessage],
         *,
         meta: AgentCallMeta,
         model: str,
         temperature: float,
-        response_format: Optional[Dict[str, Any]] = None,
+        schema_name: str,
+        schema: Dict[str, Any],
+        parser: Callable[[Any], T],
         max_output_tokens: Optional[int] = None,
-    ) -> str:
-        stage_label = meta.stage if meta.stage in self.display.panel_content else meta.stage
+    ) -> StructuredParseResult[T]:
         if self.dry_run:
-            content = self._mock_stream(stage_label, meta)
-            return content
+            payload = self._dry_payload(meta)
+            text = json.dumps(payload, ensure_ascii=False)
+            self._stream_fake(text, meta.stage)
+            parsed = parser(payload)
+            return StructuredParseResult(content=parsed, raw_text=text)
 
         if not self.api_key:
             raise RuntimeError("OPENROUTER_API_KEY is required unless --dry-run is set.")
 
-        handler = StreamingCallbackHandler(self.display, stage_label)
-        model_kwargs = {}
-        if response_format:
-            model_kwargs["response_format"] = response_format
+        response_format = self._response_format(schema_name, schema)
+        attempts = 3
+        last_error: Optional[Exception] = None
+        for attempt in range(attempts):
+            try:
+                text = self._invoke(
+                    messages,
+                    meta=meta,
+                    model=model,
+                    temperature=temperature,
+                    response_format=response_format,
+                    max_output_tokens=max_output_tokens,
+                )
+            except Exception as err:  # pragma: no cover - network heavy
+                last_error = err
+                if attempt == attempts - 1 or not self._should_retry(err):
+                    if self.structured_mode == StructuredMode.json_schema and self._looks_like_schema_error(err):
+                        raise RuntimeError(
+                            "json_schema response_format failed; switch to --structured-mode json_object "
+                            f"or choose a provider that supports schemas. Original error: {err}"
+                        ) from err
+                    raise
+                self.metrics.increment_retry()
+                time.sleep(min(2 ** attempt, 4.0))
+                continue
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError as err:
+                raise SchemaValidationError(agent=meta.agent, stage=meta.stage, payload=text, error=err)
+            try:
+                parsed = parser(data)
+            except ValidationError as err:
+                raise SchemaValidationError(agent=meta.agent, stage=meta.stage, payload=text, error=err)
+            except Exception as err:
+                raise SchemaValidationError(agent=meta.agent, stage=meta.stage, payload=text, error=err)
+            return StructuredParseResult(content=parsed, raw_text=text)
+        raise RuntimeError(f"LLM call failed after {attempts} attempts: {last_error}")
+
+    # Internal helpers -------------------------------------------------
+    def _invoke(
+        self,
+        messages: Sequence[BaseMessage],
+        *,
+        meta: AgentCallMeta,
+        model: str,
+        temperature: float,
+        response_format: Dict[str, Any],
+        max_output_tokens: Optional[int],
+    ) -> str:
+        handler = StreamingCallbackHandler(self.display, meta.stage)
+        callbacks = [handler] if self.stream else []
         llm = ChatOpenAI(
             model=model,
             temperature=temperature,
             timeout=self.timeout,
-            streaming=True,
+            streaming=self.stream,
             openai_api_key=self.api_key,
             base_url=self.base_url,
             max_tokens=max_output_tokens,
-            model_kwargs=model_kwargs or None,
+            model_kwargs={"response_format": response_format},
         )
         tags = [
             f"agent:{meta.agent}",
             f"stage:{meta.stage}",
             f"step_id:{meta.step_id}",
-            f"voter_id:{meta.voter_id if meta.voter_id is not None else 'none'}",
         ]
+        if meta.voter_id is not None:
+            tags.append(f"voter_id:{meta.voter_id}")
         metadata = {
             "agent": meta.agent,
             "stage": meta.stage,
@@ -115,52 +180,56 @@ class LLMClient:
         }
         response = llm.invoke(
             list(messages),
-            config={"callbacks": [handler], "tags": tags, "metadata": metadata},
+            config={"callbacks": callbacks, "tags": tags, "metadata": metadata},
         )
         usage = response.response_metadata.get("token_usage", {})
         self.metrics.record_usage(usage)
-        return response.content if isinstance(response.content, str) else str(response.content)
+        return response.content if isinstance(response.content, str) else json.dumps(response.content, ensure_ascii=False)
 
-    def _mock_stream(self, stage_label: str, meta: AgentCallMeta) -> str:
-        fake_payload = self._mock_structured_payload(meta)
-        fake = json.dumps(fake_payload, ensure_ascii=False)
-        tokens = fake.split()
-        for chunk in tokens:
-            self.display.stream_token(stage_label, chunk + " ")
-        self.metrics.record_usage(
-            {
-                "prompt_tokens": 0,
-                "completion_tokens": len(tokens),
-            }
-        )
-        return fake
-
-    def _mock_structured_payload(self, meta: AgentCallMeta) -> Dict[str, Any]:
-        """Generate deterministic structured payloads for dry-run mode."""
-
-        base = {
-            "thinking": f"dry-run thinking for {meta.agent}",
-            "thinking_tokens": 12,
+    def _response_format(self, schema_name: str, schema: Dict[str, Any]) -> Dict[str, Any]:
+        if self.structured_mode == StructuredMode.json_object:
+            return {"type": "json_object"}
+        sanitized = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in schema_name)[:64] or "SwarmSchema"
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": sanitized,
+                "schema": schema,
+                "strict": True,
+            },
         }
+
+    def _should_retry(self, err: Exception) -> bool:
+        text = str(err).lower()
+        transient_tokens = ("timeout", "temporarily", "rate limit", "unavailable", "overloaded")
+        return any(tok in text for tok in transient_tokens)
+
+    def _looks_like_schema_error(self, err: Exception) -> bool:
+        text = str(err).lower()
+        return "schema" in text or "response_format" in text or "json_schema" in text
+
+    def _dry_payload(self, meta: AgentCallMeta) -> Dict[str, Any]:
         if meta.agent == "planner":
-            base["output"] = {
+            return {
                 "step_id": meta.step_id,
-                "step_goal": f"Dry-run plan for step {meta.step_id}",
-                "expected_action_schema": "Action",
+                "step_goal": f"draft final answer for step {meta.step_id}",
                 "stop_condition": "continue",
                 "worker_max_tokens": 256,
             }
-        elif meta.agent.startswith("voter"):
-            base["output"] = {
+        if meta.agent.startswith("voter"):
+            return {
                 "step_id": meta.step_id,
-                "action_type": "dry_run_action",
-                "args": {"notes": f"worker {meta.agent} suggestion"},
+                "action_type": "NOTE",
+                "args": {"content": f"dry-run note from {meta.agent}"},
+                "rationale": None,
                 "confidence": 0.5,
             }
-        elif meta.agent == "judge":
-            base["output"] = {
-                "selected_signature": "dry-run-signature",
-            }
-        else:
-            base["output"] = {"mock": f"{meta.agent}-step-{meta.step_id}"}
-        return base
+        if meta.agent == "judge":
+            return {"selected_signature": "none"}
+        return {"mock": f"{meta.agent}-{meta.stage}-{meta.step_id}"}
+
+    def _stream_fake(self, text: str, stage: str) -> None:
+        tokens = text.split()
+        for token in tokens:
+            self.display.stream_token(stage, token + " ")
+        self.metrics.record_usage({"prompt_tokens": 0, "completion_tokens": len(tokens)})
