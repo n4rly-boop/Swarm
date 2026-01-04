@@ -2,7 +2,7 @@
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, Generic, List, Literal, Optional, TypeVar
 
 from pydantic import BaseModel, Field
 
@@ -14,6 +14,11 @@ class PlannerStep(BaseModel):
     step_goal: str = Field(min_length=1)
     expected_action_schema: Literal["Action"] = "Action"
     stop_condition: Literal["continue", "done"] = "continue"
+    worker_max_tokens: int = Field(
+        ge=16,
+        le=2048,
+        description="Maximum completion tokens each worker may generate this step.",
+    )
 
 
 class Action(BaseModel):
@@ -42,6 +47,12 @@ class StepRecord(BaseModel):
     judge_used: bool = False
     retries: int = 0
     verifier_passed: bool = False
+    planner_thinking: Optional[str] = None
+    planner_thinking_tokens: Optional[int] = None
+    judge_thinking: Optional[str] = None
+    judge_thinking_tokens: Optional[int] = None
+    voter_thinking: Dict[int, Optional[str]] = Field(default_factory=dict)
+    voter_thinking_tokens: Dict[int, Optional[int]] = Field(default_factory=dict)
 
 
 class RunStats(BaseModel):
@@ -93,10 +104,37 @@ class SwarmConfig(BaseModel):
     project_name: str = "swarmmaker-mvp"
 
 
+class StructuredLLMOutput(BaseModel):
+    """Wrapper schema forcing agents to separate thinking from final payload."""
+
+    thinking: Optional[str] = Field(
+        default=None,
+        description="Optional private reasoning or scratchpad tokens.",
+        max_length=10000,
+    )
+    thinking_tokens: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description="Optional count of tokens spent inside `thinking`.",
+    )
+    output: Any = Field(description="Primary payload that must satisfy the caller schema.")
+
+
+T = TypeVar("T")
+
+
+@dataclass
+class StructuredParseResult(Generic[T]):
+    """Return type from `_request_json`, exposing parsed content and metadata."""
+
+    content: T
+    thinking: Optional[str]
+    thinking_tokens: Optional[int]
+
+
 @dataclass
 class AgentCallMeta:
     agent: str
     stage: str
     step_id: int
     voter_id: Optional[int] = None
-

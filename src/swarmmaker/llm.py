@@ -1,4 +1,5 @@
 """LLM client wrapper for OpenRouter via LangChain."""
+import json
 import time
 from typing import Any, Dict, Optional, Sequence
 
@@ -75,6 +76,8 @@ class LLMClient:
         meta: AgentCallMeta,
         model: str,
         temperature: float,
+        response_format: Optional[Dict[str, Any]] = None,
+        max_output_tokens: Optional[int] = None,
     ) -> str:
         stage_label = meta.stage if meta.stage in self.display.panel_content else meta.stage
         if self.dry_run:
@@ -85,6 +88,9 @@ class LLMClient:
             raise RuntimeError("OPENROUTER_API_KEY is required unless --dry-run is set.")
 
         handler = StreamingCallbackHandler(self.display, stage_label)
+        model_kwargs = {}
+        if response_format:
+            model_kwargs["response_format"] = response_format
         llm = ChatOpenAI(
             model=model,
             temperature=temperature,
@@ -92,6 +98,8 @@ class LLMClient:
             streaming=True,
             openai_api_key=self.api_key,
             base_url=self.base_url,
+            max_tokens=max_output_tokens,
+            model_kwargs=model_kwargs or None,
         )
         tags = [
             f"agent:{meta.agent}",
@@ -114,7 +122,8 @@ class LLMClient:
         return response.content if isinstance(response.content, str) else str(response.content)
 
     def _mock_stream(self, stage_label: str, meta: AgentCallMeta) -> str:
-        fake = f"{{\"mock\": \"{meta.agent} step {meta.step_id}\"}}"
+        fake_payload = self._mock_structured_payload(meta)
+        fake = json.dumps(fake_payload, ensure_ascii=False)
         tokens = fake.split()
         for chunk in tokens:
             self.display.stream_token(stage_label, chunk + " ")
@@ -125,3 +134,33 @@ class LLMClient:
             }
         )
         return fake
+
+    def _mock_structured_payload(self, meta: AgentCallMeta) -> Dict[str, Any]:
+        """Generate deterministic structured payloads for dry-run mode."""
+
+        base = {
+            "thinking": f"dry-run thinking for {meta.agent}",
+            "thinking_tokens": 12,
+        }
+        if meta.agent == "planner":
+            base["output"] = {
+                "step_id": meta.step_id,
+                "step_goal": f"Dry-run plan for step {meta.step_id}",
+                "expected_action_schema": "Action",
+                "stop_condition": "continue",
+                "worker_max_tokens": 256,
+            }
+        elif meta.agent.startswith("voter"):
+            base["output"] = {
+                "step_id": meta.step_id,
+                "action_type": "dry_run_action",
+                "args": {"notes": f"worker {meta.agent} suggestion"},
+                "confidence": 0.5,
+            }
+        elif meta.agent == "judge":
+            base["output"] = {
+                "selected_signature": "dry-run-signature",
+            }
+        else:
+            base["output"] = {"mock": f"{meta.agent}-step-{meta.step_id}"}
+        return base

@@ -1,8 +1,9 @@
 """LangGraph workflow for SwarmMaker."""
 import json
 import random
+import re
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, TypedDict
+from typing import Any, Callable, Dict, List, Optional, Sequence, TypedDict, TypeVar
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import ValidationError
@@ -20,6 +21,8 @@ from .schemas import (
     RunResult,
     RunStats,
     StepRecord,
+    StructuredLLMOutput,
+    StructuredParseResult,
     SwarmConfig,
 )
 from .verify import ActionVerifier
@@ -190,8 +193,11 @@ def planner_node(config: SwarmConfig):
             return state
 
         step_id = state.get("steps_completed", 0) + 1
+        budget_remaining = max(0, config.max_total_tokens - metrics.tokens_total())
         planner_input = {
             "task": state["task"],
+            "token_budget_remaining": budget_remaining,
+            "swarm_size": config.swarm_size,
             "recent_history": [
                 {
                     "step_id": record.step_id,
@@ -201,40 +207,91 @@ def planner_node(config: SwarmConfig):
                 for record in state.get("history", [])[-3:]
             ],
         }
+        worker_token_hint = max(
+            32,
+            min(
+                512,
+                (budget_remaining // max(config.swarm_size, 1)) or 32,
+            ),
+        )
+        schema_hint = json.dumps(
+            {
+                "step_id": step_id,
+                "step_goal": "describe the immediate subtask you want workers to perform next",
+                "expected_action_schema": "Action",
+                "stop_condition": "continue|done",
+                "worker_max_tokens": worker_token_hint,
+            },
+            ensure_ascii=False,
+        )
+        examples = (
+            '{ "step_id": %d, "step_goal": "outline solution approach", '
+            '"expected_action_schema": "Action", "stop_condition": "continue", '
+            '"worker_max_tokens": %d }'
+            % (step_id, worker_token_hint)
+        )
+        wrapper_hint = _structured_wrapper_instructions("PlannerStep")
         messages = [
             SystemMessage(
                 content=(
-                    "You are the SwarmMaker planner. "
-                    "Output only valid JSON describing the next micro-step. "
-                    "Be concise."
+                    "You are the SwarmMaker planner.\n"
+                    f"{wrapper_hint}\n"
+                    "Fields (all required): step_id(int), step_goal(str), expected_action_schema (literal \"Action\"), "
+                    "stop_condition (either \"continue\" or \"done\"), worker_max_tokens (int between 16 and 2048 indicating the completion token cap per worker)."
                 )
             ),
             HumanMessage(
                 content=(
-                    "Task:\n"
-                    f"{state['task']}\n\n"
-                    f"Current state:\n{json.dumps(planner_input, ensure_ascii=False)}"
+                    f"Task:\n{state['task']}\n\n"
+                    f"Current state:\n{json.dumps(planner_input, ensure_ascii=False)}\n\n"
+                    f"Recommend a `worker_max_tokens` value <= {worker_token_hint} unless the task clearly requires more detail.\n"
+                    f"Schema hint:\n{schema_hint}\n"
+                    f"Example:\n{examples}\n"
+                    "Remember: respond with raw JSON only; never wrap in markdown fences."
                 )
             ),
         ]
         meta = AgentCallMeta(agent="planner", stage="PLANNER", step_id=step_id)
-        planner_step = _request_json(
+        planner_result = _request_json(
             runtime.llm,
             messages,
             meta=meta,
             model=config.model_planner,
             temperature=config.temperature_planner,
-            parser=PlannerStep.model_validate_json,
+            parser=PlannerStep.model_validate,
+            output_schema=PlannerStep.model_json_schema(),
             runtime=runtime,
         )
+        planner_step = planner_result.content
         runtime.events.log("planner_step", planner_step.model_dump())
-        runtime.display.set_panel_text("PLANNER", json.dumps(planner_step.model_dump(), indent=2))
+        if planner_result.thinking or planner_result.thinking_tokens is not None:
+            runtime.events.log(
+                "planner_thinking",
+                {
+                    "thinking": planner_result.thinking,
+                    "thinking_tokens": planner_result.thinking_tokens,
+                },
+            )
+        runtime.display.set_panel_text(
+            "PLANNER",
+            json.dumps(
+                {
+                    "thinking": planner_result.thinking,
+                    "thinking_tokens": planner_result.thinking_tokens,
+                    "output": planner_step.model_dump(),
+                },
+                indent=2,
+                ensure_ascii=False,
+            ),
+        )
         history = runtime.history
         state["history"] = history
         history.append(
             StepRecord(
                 step_id=planner_step.step_id,
                 planner_step=planner_step,
+                planner_thinking=planner_result.thinking,
+                planner_thinking_tokens=planner_result.thinking_tokens,
             )
         )
         state["step_counter"] = step_id
@@ -272,6 +329,9 @@ def voters_node(config: SwarmConfig):
             "Draft candidate final answers.",
             "Plan follow-up analysis.",
         ]
+        voter_thinking: Dict[int, Optional[str]] = {}
+        voter_thinking_tokens: Dict[int, Optional[int]] = {}
+        worker_token_cap = max(16, min(planner_step.worker_max_tokens, runtime.config.max_total_tokens))
         for idx in range(1, config.swarm_size + 1):
             stage = f"VOTER#{idx}" if idx <= runtime.display.visible_voters else "VOTERS(+extra)"
             meta = AgentCallMeta(agent=f"voter_{idx}", stage=stage, step_id=planner_step.step_id, voter_id=idx)
@@ -283,20 +343,43 @@ def voters_node(config: SwarmConfig):
                 config.show_rationale,
                 style_hint,
             )
-            action = _request_json(
+            action_result = _request_json(
                 runtime.llm,
                 voter_messages,
                 meta=meta,
                 model=config.model_worker,
                 temperature=config.temperature_worker,
-                parser=Action.model_validate_json,
+                parser=Action.model_validate,
+                output_schema=Action.model_json_schema(),
                 runtime=runtime,
+                max_output_tokens=worker_token_cap,
             )
-            runtime.display.set_panel_text(stage, json.dumps(action.model_dump(), indent=2))
+            action = action_result.content
+            runtime.display.set_panel_text(
+                stage,
+                json.dumps(
+                    {
+                        "thinking": action_result.thinking,
+                        "thinking_tokens": action_result.thinking_tokens,
+                        "output": action.model_dump(),
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                ),
+            )
+            if action_result.thinking is not None:
+                voter_thinking[idx] = action_result.thinking
+            if action_result.thinking_tokens is not None:
+                voter_thinking_tokens[idx] = action_result.thinking_tokens
             actions.append(action)
         runtime.events.log("voter_batch", {"count": len(actions), "step_id": planner_step.step_id})
         state["candidates"] = actions
-        _update_history(state, candidates_signatures=[action.signature for action in actions])
+        _update_history(
+            state,
+            candidates_signatures=[action.signature for action in actions],
+            voter_thinking=voter_thinking or {},
+            voter_thinking_tokens=voter_thinking_tokens or {},
+        )
         return state
 
     return _node
@@ -339,29 +422,50 @@ def judge_node(config: SwarmConfig):
             state["retrying"] = True
             return state
         content = json.dumps([c.model_dump() for c in candidates], ensure_ascii=False, indent=2)
+        wrapper_hint = _structured_wrapper_instructions("JudgeSelection", include_example=False)
         messages = [
             SystemMessage(
-                content="You are the SwarmMaker judge. Choose the better JSON action."
+                content="You are the SwarmMaker judge. Choose the better JSON action and wrap it in the structured schema.\n"
+                f"{wrapper_hint}\n"
+                'Your `output` object must look like {"selected_signature": "<signature-or-none>"} where selecting "none" requests another vote.'
             ),
             HumanMessage(
                 content=(
                     f"Planner step: {planner_step.step_goal}\n"
                     f"Candidates:\n{content}\n"
-                    "Respond as JSON {\"selected_signature\": \"...\"} or set \"none\"."
+                    "Remember: respond with raw JSON only; do NOT wrap in markdown."
                 )
             ),
         ]
         meta = AgentCallMeta(agent="judge", stage="JUDGE", step_id=planner_step.step_id)
+        judge_schema = {
+            "type": "object",
+            "properties": {
+                "selected_signature": {
+                    "type": "string",
+                    "description": "Signature of the chosen action, or the literal string \"none\" to request another vote.",
+                }
+            },
+            "required": ["selected_signature"],
+            "additionalProperties": False,
+        }
         response = _request_json(
             runtime.llm,
             messages,
             meta=meta,
             model=config.model_judge,
             temperature=config.temperature_judge,
-            parser=json.loads,
+            parser=lambda payload: payload,
+            output_schema=judge_schema,
             runtime=runtime,
         )
-        signature = response.get("selected_signature")
+        selection = response.content
+        signature = selection.get("selected_signature") if isinstance(selection, dict) else None
+        if response.thinking or response.thinking_tokens is not None:
+            runtime.events.log(
+                "judge_thinking",
+                {"thinking": response.thinking, "thinking_tokens": response.thinking_tokens},
+            )
         if signature == "none":
             runtime.metrics.increment_retry()
             runtime.events.log("judge_none", {"step_id": planner_step.step_id})
@@ -369,6 +473,11 @@ def judge_node(config: SwarmConfig):
             runtime.display.set_panel_text("JUDGE", "No selection; requesting new votes.")
             state["retrying"] = True
             state["chosen_action"] = None
+            _update_history(
+                state,
+                judge_thinking=response.thinking,
+                judge_thinking_tokens=response.thinking_tokens,
+            )
             return state
         state["retrying"] = False
         selected = next((c for c in candidates if c.signature == signature), None)
@@ -378,8 +487,25 @@ def judge_node(config: SwarmConfig):
             runtime.metrics.increment_retry()
             return state
         state["chosen_action"] = selected
-        runtime.display.set_panel_text("JUDGE", f"Selected signature: {selected.signature}")
-        _update_history(state, judge_used=True, chosen_signature=selected.signature)
+        runtime.display.set_panel_text(
+            "JUDGE",
+            json.dumps(
+                {
+                    "thinking": response.thinking,
+                    "thinking_tokens": response.thinking_tokens,
+                    "output": {"selected_signature": selected.signature},
+                },
+                indent=2,
+                ensure_ascii=False,
+            ),
+        )
+        _update_history(
+            state,
+            judge_used=True,
+            chosen_signature=selected.signature,
+            judge_thinking=response.thinking,
+            judge_thinking_tokens=response.thinking_tokens,
+        )
         return state
 
     return _node
@@ -497,6 +623,148 @@ def _budget_exhausted(runtime: RuntimeContext) -> bool:
     return runtime.metrics.tokens_total() >= runtime.config.max_total_tokens
 
 
+def _extract_json_payload(text: str) -> str:
+    """Best-effort extraction of JSON body by removing fences and headers."""
+
+    stripped = text.strip()
+    if not stripped:
+        return stripped
+    # Remove stray provider control tokens.
+    for token in ("<|fim_middle|>", "<|fim_end|>", "<|assistant|>", "<|user|>"):
+        stripped = stripped.replace(token, "")
+    if stripped.startswith("```"):
+        lines = stripped.splitlines()
+        if lines:
+            lines = lines[1:]  # drop opening fence
+        while lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        stripped = "\n".join(lines).strip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        candidate = _slice_first_json_blob(stripped)
+        if candidate:
+            return candidate
+    candidate = _slice_first_json_blob(stripped)
+    return candidate or stripped
+
+
+def _slice_first_json_blob(text: str) -> Optional[str]:
+    """Return first balanced JSON object/array substring if possible."""
+
+    stack: List[str] = []
+    start: Optional[int] = None
+    in_string = False
+    escape = False
+
+    for idx, ch in enumerate(text):
+        if start is None:
+            if ch in ("{", "["):
+                start = idx
+                stack.append("}" if ch == "{" else "]")
+            continue
+        if not stack:
+            break
+        if escape:
+            escape = False
+            continue
+        if ch == "\\" and in_string:
+            escape = True
+            continue
+        prev_char = text[idx - 1] if idx > 0 else ""
+        if ch == '"' and prev_char != "\\":
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        expected = stack[-1]
+        if ch == expected:
+            stack.pop()
+            if not stack:
+                return text[start : idx + 1].strip()
+        elif ch in ("{", "["):
+            stack.append("}" if ch == "{" else "]")
+    return None
+
+
+def _extract_missing_fields(err: ValidationError) -> List[str]:
+    fields: List[str] = []
+    for detail in err.errors():
+        if detail.get("type") == "missing":
+            loc = detail.get("loc")
+            if not loc:
+                continue
+            name = ".".join(str(part) for part in loc)
+            fields.append(name)
+    return fields
+
+
+def _structured_wrapper_instructions(schema_name: str, *, include_example: bool = True) -> str:
+    """Shared hint describing the enforced structured output wrapper."""
+
+    hint = (
+        "Return ONLY valid JSON, no prose or markdown fences.\n"
+        "Your response MUST be a JSON object with keys `thinking` (string, optional), "
+        "`thinking_tokens` (integer, optional), and `output` (object). "
+        f"The `output` object MUST strictly match the {schema_name} schema with valid JSON."
+    )
+    if include_example:
+        example = {
+            "thinking": "short hidden reasoning",
+            "thinking_tokens": 24,
+            "output": {
+                "placeholder": "replace with schema-compliant fields"
+            },
+        }
+        hint += f" Example: {json.dumps(example, ensure_ascii=False)}."
+    hint += " No extra keys, markdown fences, or commentary are allowed."
+    return hint
+
+
+def _build_structured_schema(output_schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Return JSON schema for StructuredLLMOutput with injected output schema."""
+
+    return {
+        "type": "object",
+        "properties": {
+            "thinking": {
+                "type": "string",
+                "description": "Optional hidden reasoning.",
+            },
+            "thinking_tokens": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Token count spent inside thinking.",
+            },
+            "output": output_schema,
+        },
+        "required": ["output"],
+        "additionalProperties": False,
+    }
+
+
+def _structured_response_format(meta: AgentCallMeta, schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Return OpenAI response_format payload for strict schema enforcement."""
+
+    schema_name = _sanitize_schema_name(meta)
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": schema_name,
+            "schema": schema,
+            "strict": True,
+        },
+    }
+
+
+def _sanitize_schema_name(meta: AgentCallMeta) -> str:
+    candidate = f"{meta.agent}_{meta.stage}_schema"
+    sanitized = re.sub(r"[^A-Za-z0-9_]", "_", candidate)
+    sanitized = sanitized.strip("_")[:64]
+    return sanitized or "SwarmMakerSchema"
+
+
+TParsed = TypeVar("TParsed")
+
+
 def _request_json(
     llm: LLMClient,
     messages: Sequence,
@@ -504,22 +772,65 @@ def _request_json(
     meta: AgentCallMeta,
     model: str,
     temperature: float,
-    parser,
+    parser: Callable[[Any], TParsed],
+    output_schema: Dict[str, Any],
     runtime: RuntimeContext,
-):
+    max_output_tokens: Optional[int] = None,
+) -> StructuredParseResult[TParsed]:
     attempts = 2
-    prompt_messages = list(messages)
+    wrapper_schema = _build_structured_schema(output_schema)
+    schema_directive = SystemMessage(
+        content=(
+            "STRICT JSON SCHEMA (respond with JSON only, beginning with `{`):\n"
+            f"{json.dumps(wrapper_schema, ensure_ascii=False, indent=2)}"
+        )
+    )
+    response_format = _structured_response_format(meta, wrapper_schema)
+    base_messages = [schema_directive, *messages]
+    prompt_messages = list(base_messages)
     for attempt in range(attempts):
-        text = llm.complete(prompt_messages, meta=meta, model=model, temperature=temperature)
+        text = llm.complete(
+            prompt_messages,
+            meta=meta,
+            model=model,
+            temperature=temperature,
+            response_format=response_format,
+            max_output_tokens=max_output_tokens,
+        )
         try:
-            return parser(text)
-        except (json.JSONDecodeError, ValidationError):
+            payload = _extract_json_payload(text)
+            structured = StructuredLLMOutput.model_validate_json(payload)
+            parsed = parser(structured.output)
+            return StructuredParseResult(
+                content=parsed,
+                thinking=structured.thinking,
+                thinking_tokens=structured.thinking_tokens,
+            )
+        except (json.JSONDecodeError, ValidationError, TypeError, ValueError) as err:
             runtime.metrics.increment_retry()
+            correction_hint = "Previous output was invalid. Reply with ONLY valid JSON following the structured schema with `thinking`, `thinking_tokens`, and `output` keys."
+            if isinstance(err, ValidationError):
+                missing_fields = _extract_missing_fields(err)
+                if missing_fields:
+                    correction_hint = (
+                        "Previous output was invalid because these fields were missing or malformed: "
+                        f"{', '.join(sorted(set(missing_fields)))}. "
+                        "Return valid JSON with all required fields populated (e.g., include `output.step_id`)."
+                    )
+            runtime.events.log(
+                "json_parse_error",
+                {
+                    "agent": meta.agent,
+                    "stage": meta.stage,
+                    "error": str(err),
+                    "snippet": text[:200],
+                },
+            )
             if attempt == attempts - 1:
                 raise
             runtime.display.log_event(f"Invalid JSON from {meta.agent}, retrying.")
-            prompt_messages = list(messages) + [
-                HumanMessage(content="Previous output was invalid JSON. Respond with valid JSON only.")
+            prompt_messages = list(base_messages) + [
+                HumanMessage(content=correction_hint)
             ]
     raise RuntimeError("JSON parsing failed")
 
@@ -528,12 +839,14 @@ def _voter_prompt(task: str, planner_step: PlannerStep, voter_index: int, show_r
     rationale_instruction = (
         "Include a short rationale sentence." if show_rationale else "Omit the rationale field."
     )
+    wrapper_hint = _structured_wrapper_instructions("Action")
     messages = [
         SystemMessage(
             content=(
                 f"You are SwarmMaker worker #{voter_index}. Propose a single actionable JSON Action.\n"
-                "Fields: step_id, action_type, args (object), optional rationale (<=1 sentence), confidence (0-1).\n"
-                "Do not reveal hidden reasoning. Respond with JSON only."
+                "Fields: step_id, action_type, args (object), optional rationale (<=1 sentence), confidence (0-1). "
+                "Use the exact field names shown; do not invent alternatives like `confident`.\n"
+                f"{wrapper_hint} Put any private reasoning inside `thinking`."
             )
         ),
         HumanMessage(
@@ -541,8 +854,11 @@ def _voter_prompt(task: str, planner_step: PlannerStep, voter_index: int, show_r
                 f"Task: {task}\n"
                 f"Step goal: {planner_step.step_goal}\n"
                 f"Stop condition: {planner_step.stop_condition}\n"
+                f"Planner token cap per worker: {planner_step.worker_max_tokens} completion tokens (hard limit).\n"
                 f"Style hint: {style_hint}\n"
-                f"{rationale_instruction}"
+                f"{rationale_instruction}\n"
+                f"Set `output.step_id` to {planner_step.step_id} exactly. "
+                "Place all required keys even if obvious. Respond with valid JSON only."
             )
         ),
     ]
