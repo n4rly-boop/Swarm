@@ -1,4 +1,4 @@
-"""Data contracts and helpers for SwarmMaker."""
+"""Data contracts for the MAKER-style SwarmMaker runtime."""
 import json
 from dataclasses import dataclass
 from datetime import datetime
@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 
 
 def canonical_json(obj: Any) -> str:
-    """Return the canonical serialized representation used across the system."""
+    """Return canonical JSON for deterministic signatures and logs."""
 
     def default(o: Any) -> Any:
         if isinstance(o, Path):
@@ -23,59 +23,69 @@ def canonical_json(obj: Any) -> str:
 
 
 class StructuredMode(str, Enum):
+    """Supported response-format modes for providers."""
+
     json_schema = "json_schema"
     json_object = "json_object"
 
 
-class PlannerStep(BaseModel):
-    """Planner output describing the next worker goal."""
+class DecompositionProposal(BaseModel):
+    """LLM-proposed decomposition of a problem into two subproblems."""
 
-    step_id: int
-    step_goal: str = Field(min_length=1, description="Concrete instruction for workers.")
-    stop_condition: Literal["continue", "done"] = "continue"
-    worker_max_tokens: int = Field(
-        ge=16,
-        le=2048,
-        description="Max completion tokens for each worker proposal.",
+    subproblem_a: str = Field(min_length=1, description="First subproblem to solve.")
+    subproblem_b: str = Field(min_length=1, description="Second subproblem to solve.")
+    compose_fn: str = Field(min_length=1, description="Instructions to combine results.")
+    is_atomic: bool = Field(
+        description="True when the problem cannot be decomposed further and should be solved directly.",
     )
-
-
-ActionType = Literal["FINAL", "NOTE", "ASK_CLARIFY", "DO"]
-
-
-class Action(BaseModel):
-    """Worker action proposal."""
-
-    step_id: int
-    action_type: ActionType
-    args: Dict[str, Any] = Field(default_factory=dict)
-    rationale: Optional[str] = Field(
-        default=None,
-        max_length=280,
-        description="Optional single sentence rationale.",
-    )
-    confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    rationale: str = Field(min_length=1, description="Why this decomposition is appropriate.")
 
     @property
     def signature(self) -> str:
-        """Canonical signature used for deduping, logging, and consensus."""
+        return canonical_json(
+            {
+                "subproblem_a": self.subproblem_a,
+                "subproblem_b": self.subproblem_b,
+                "compose_fn": self.compose_fn,
+                "is_atomic": self.is_atomic,
+            }
+        )
 
-        return canonical_json({"action_type": self.action_type, "args": self.args})
+
+class AtomicSolution(BaseModel):
+    """Atomic solver output containing the proposed answer."""
+
+    solution: str = Field(min_length=1, description="Candidate solution string.")
+    confidence: float = Field(ge=0.0, le=1.0)
+    work_shown: str = Field(min_length=1, description="Audit trail for the answer.")
+
+    @property
+    def signature(self) -> str:
+        return canonical_json({"solution": self.solution.strip()})
 
 
-class StepRecord(BaseModel):
-    """History entry shown in result artifacts."""
+class TaskState(BaseModel):
+    """Minimal state snapshot shared with the orchestrator."""
+
+    task: str
+    decomposition_tree: Dict[str, Any] = Field(default_factory=dict)
+    solved_subproblems: Dict[str, str] = Field(default_factory=dict)
+    current_problem: str
+    depth: int = 0
+
+
+class StepTrace(BaseModel):
+    """History entry captured for each decomposition or atomic step."""
 
     step_id: int
-    planner_step: PlannerStep
-    candidate_signatures: List[str] = Field(default_factory=list)
-    chosen_signature: Optional[str] = None
-    judge_used: bool = False
-    retries: int = 0
-    verifier_passed: bool = False
-    domain_state_snapshot: Optional[Dict[str, Any]] = None  # Serialized domain state
-    draft_answer: Optional[str] = None
-    final_answer: Optional[str] = None
+    kind: Literal["decomposition", "atomic"]
+    problem: str
+    depth: int
+    candidates: List[Dict[str, Any]] = Field(default_factory=list)
+    chosen: Optional[Dict[str, Any]] = None
+    votes: Dict[str, int] = Field(default_factory=dict)
+    notes: Optional[str] = None
+    rejections: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class RunStats(BaseModel):
@@ -98,39 +108,36 @@ class RunArtifacts(BaseModel):
 class RunResult(BaseModel):
     task: str
     final_answer: Optional[str]
-    steps: List[StepRecord]
+    steps: List[StepTrace]
     stats: RunStats
     artifacts: RunArtifacts
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
 class SwarmConfig(BaseModel):
-    """Runtime configuration for the swarm."""
+    """Runtime configuration for the MAKER orchestrator."""
 
-    model_planner: str
-    model_worker: str
-    model_judge: str
-    swarm_size: int = 4
+    model_decomposer: str
+    model_solver: str
+    model_discriminator: str
+    batch_size: int = 5
     ahead_by: int = 2
-    max_steps: int = 8
-    max_retries: int = 2
-    max_total_tokens: int = 20_000
-    max_wall_seconds: int = 180
+    max_rounds: int = 10
+    max_depth: int = 6
+    max_total_tokens: int = 50_000
     timeout_seconds: int = 60
-    temperature_planner: float = 0.3
-    temperature_worker: float = 0.5
-    temperature_judge: float = 0.2
-    seed_base: int = 42
-    show_rationale: bool = False
+    temperature_decomposer: float = 0.3
+    temperature_solver: float = 0.8
+    temperature_discriminator: float = 0.2
     dry_run: bool = False
-    stream: bool = True
     log_dir: Path = Field(default_factory=lambda: Path("runs"))
-    project_name: str = "swarmmaker-mvp"
     structured_mode: StructuredMode = StructuredMode.json_schema
 
 
 @dataclass
 class AgentCallMeta:
+    """Metadata for tagging LLM calls."""
+
     agent: str
     stage: str
     step_id: int

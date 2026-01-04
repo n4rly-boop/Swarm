@@ -1,6 +1,4 @@
-"""Command-line entrypoint for SwarmMaker."""
-import os
-import sys
+"""Command-line entrypoint for the MAKER-aligned SwarmMaker runtime."""
 import time
 from datetime import datetime
 from pathlib import Path
@@ -8,23 +6,13 @@ from typing import Optional
 
 import typer
 
-from .callbacks import LiveSwarmDisplay
-from .consensus import ConsensusEngine
 from .config import settings
-from .finalizer import BestEffortFinalizer
-from .graph import LangSmithManager, RuntimeContext, run_swarm
+from .decomposer import Decomposer
+from .discriminator import DecompositionDiscriminator, SolutionDiscriminator
 from .io import EventLogger, ensure_log_dir, save_json_result, save_markdown_result
 from .llm import LLMClient, MetricsTracker
-from .policies import (
-    ASKClarifyTerminationPolicy,
-    BudgetAwareStrategyPolicy,
-    MaxDecompositionDepthPolicy,
-    NoIdenticalStatePolicy,
-    PolicyEngine,
-    StopConditionDonePolicy,
-)
-from .progress import ProgressTracker
-from .router import TaskRouter
+from .orchestrator import MakerOrchestrator, MakerRuntime
+from .red_flag import RedFlagGuard
 from .schemas import (
     RunArtifacts,
     RunResult,
@@ -33,77 +21,66 @@ from .schemas import (
     SwarmConfig,
     canonical_json,
 )
-from .termination import TerminationAuthority
-from .verify import ActionVerifier
+from .solver import AtomicSolver
+from .verify import StateVerifier
 
-app = typer.Typer(add_completion=False, help="SwarmMaker multi-agent CLI.")
+app = typer.Typer(add_completion=False, help="SwarmMaker MAKER orchestrator CLI.")
 
-DEFAULT_PLANNER_MODEL = "google/gemini-2.5-flash-preview-09-2025"
-DEFAULT_WORKER_MODEL = "qwen/qwen2.5-coder-7b-instruct"
-DEFAULT_JUDGE_MODEL = "google/gemini-2.5-flash-preview-09-2025"
+DEFAULT_DECOMPOSER_MODEL = "google/gemini-2.5-flash-preview-09-2025"
+DEFAULT_SOLVER_MODEL = "qwen/qwen2.5-7b-instruct"
+DEFAULT_DISCRIMINATOR_MODEL = "google/gemini-2.5-flash-preview-09-2025"
 
 
 @app.command()
 def main(
-    task: str = typer.Argument(..., help="User task or prompt for the swarm."),
-    model_planner: str = typer.Option(DEFAULT_PLANNER_MODEL, "--model-planner", show_default=True),
-    model_worker: str = typer.Option(DEFAULT_WORKER_MODEL, "--model-worker", show_default=True),
-    model_judge: str = typer.Option(DEFAULT_JUDGE_MODEL, "--model-judge", show_default=True),
-    swarm_size: int = typer.Option(5, "--swarm-size"),
-    ahead_by: int = typer.Option(2, "--ahead-by", help="Early stop K votes ahead."),
-    max_steps: int = typer.Option(15, "--max-steps"),
-    max_retries: int = typer.Option(2, "--max-retries"),
-    max_total_tokens: int = typer.Option(50_000, "--max-total-tokens"),
-    max_wall_seconds: int = typer.Option(180, "--max-wall-seconds"),
+    task: str = typer.Argument(..., help="Task description to solve."),
+    model_decomposer: str = typer.Option(DEFAULT_DECOMPOSER_MODEL, "--model-decomposer", show_default=True),
+    model_solver: str = typer.Option(DEFAULT_SOLVER_MODEL, "--model-solver", show_default=True),
+    model_discriminator: str = typer.Option(DEFAULT_DISCRIMINATOR_MODEL, "--model-discriminator", show_default=True),
+    batch_size: int = typer.Option(4, "--batch-size", help="Samples per round for decomposition and solving."),
+    ahead_by: int = typer.Option(2, "--ahead-by", help="Votes required beyond runner-up."),
+    max_rounds: int = typer.Option(5, "--max-rounds", help="Max sampling rounds per stage."),
+    max_depth: int = typer.Option(6, "--max-depth", help="Maximum recursion depth."),
+    max_total_tokens: int = typer.Option(50_000, "--max-total-tokens", help="Budget for all LLM calls."),
     timeout_seconds: int = typer.Option(60, "--timeout-seconds"),
-    temperature_planner: float = typer.Option(0.3, "--temperature-planner"),
-    temperature_worker: float = typer.Option(0.8, "--temperature-worker"),
-    temperature_judge: float = typer.Option(0.2, "--temperature-judge"),
-    seed_base: int = typer.Option(42, "--seed", "--seed-base", help="Seed for stochastic prompts.", show_default=True),
-    show_rationale: bool = typer.Option(False, "--show-rationale/--hide-rationale", show_default=True),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Generate deterministic mock outputs."),
+    temperature_decomposer: float = typer.Option(0.3, "--temperature-decomposer"),
+    temperature_solver: float = typer.Option(0.8, "--temperature-solver"),
+    temperature_discriminator: float = typer.Option(0.2, "--temperature-discriminator"),
     structured_mode: StructuredMode = typer.Option(
         StructuredMode.json_schema,
         "--structured-mode",
         case_sensitive=False,
-        help="Provider response_format enforcement mode.",
+        help="response_format enforcement mode",
     ),
-    stream: bool = typer.Option(True, "--stream/--no-stream", show_default=True),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Return deterministic mock results."),
     log_dir: Optional[Path] = typer.Option(
-        None, "--log-dir", help="Directory for logs (defaults to runs/<timestamp>)."
+        None, "--log-dir", help="Directory for artifacts (defaults to runs/<timestamp>)."
     ),
-    project_name: str = typer.Option("swarmmaker-mvp", "--project-name"),
 ) -> None:
-    """Run the SwarmMaker multi-agent flow for the provided task."""
+    """Execute the MAKER step loop for the provided task."""
 
     _ = settings
     timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-    target_log_dir = log_dir or Path("runs") / timestamp
-    target_log_dir = ensure_log_dir(target_log_dir)
+    target_log_dir = ensure_log_dir(log_dir or Path("runs") / timestamp)
     events_path = target_log_dir / "events.jsonl"
     result_json_path = target_log_dir / "result.json"
     result_md_path = target_log_dir / "result.md"
 
     config = SwarmConfig(
-        model_planner=model_planner,
-        model_worker=model_worker,
-        model_judge=model_judge,
-        swarm_size=swarm_size,
+        model_decomposer=model_decomposer,
+        model_solver=model_solver,
+        model_discriminator=model_discriminator,
+        batch_size=batch_size,
         ahead_by=ahead_by,
-        max_steps=max_steps,
-        max_retries=max_retries,
+        max_rounds=max_rounds,
+        max_depth=max_depth,
         max_total_tokens=max_total_tokens,
-        max_wall_seconds=max_wall_seconds,
         timeout_seconds=timeout_seconds,
-        temperature_planner=temperature_planner,
-        temperature_worker=temperature_worker,
-        temperature_judge=temperature_judge,
-        seed_base=seed_base,
-        show_rationale=show_rationale,
+        temperature_decomposer=temperature_decomposer,
+        temperature_solver=temperature_solver,
+        temperature_discriminator=temperature_discriminator,
         dry_run=dry_run,
-        stream=stream,
         log_dir=target_log_dir,
-        project_name=project_name,
         structured_mode=structured_mode,
     )
 
@@ -114,106 +91,48 @@ def main(
 
     typer.echo(f"Configuration: {canonical_json(config.model_dump(mode='python'))}")
 
-    display = LiveSwarmDisplay(config.swarm_size, stream_enabled=config.stream)
-    display.start()
     events = EventLogger(events_path)
     events.log("task", {"task": task}, message="task received")
-    display.log_event(f"Logging to {target_log_dir}")
 
     metrics = MetricsTracker(config.max_total_tokens)
     llm_client = LLMClient(
         api_key=openrouter_key,
         base_url=settings.get("OPENROUTER_BASE_URL"),
         timeout=config.timeout_seconds,
-        display=display,
         metrics=metrics,
         structured_mode=config.structured_mode,
-        stream=config.stream,
         dry_run=config.dry_run,
     )
-    verifier = ActionVerifier()
-    consensus = ConsensusEngine(config.ahead_by, verifier=verifier)
-    langsmith = LangSmithManager(
-        enabled=bool(os.environ.get("LANGSMITH_API_KEY")),
-        project_name=config.project_name,
-        task=task,
-    )
 
-    # Initialize new system components
-    router = TaskRouter(llm_client, config)
-    policy_engine = PolicyEngine()
-    progress = ProgressTracker()
-    termination = TerminationAuthority(config)
-    finalizer = BestEffortFinalizer(llm_client, config)
-
-    # Register all policies
-    policy_engine.register(StopConditionDonePolicy())
-    policy_engine.register(NoIdenticalStatePolicy())
-    policy_engine.register(ASKClarifyTerminationPolicy())
-    policy_engine.register(MaxDecompositionDepthPolicy())
-    policy_engine.register(BudgetAwareStrategyPolicy())
-
-    runtime = RuntimeContext(
-        llm=llm_client,
-        consensus=consensus,
-        verifier=verifier,
-        display=display,
-        events=events,
-        metrics=metrics,
-        langsmith=langsmith,
+    runtime = MakerRuntime(
         config=config,
-        history=[],
-        router=router,
-        policy_engine=policy_engine,
-        progress=progress,
-        termination=termination,
-        finalizer=finalizer,
+        decomposer=Decomposer(llm_client, config),
+        solver=AtomicSolver(llm_client, config),
+        decomposition_discriminator=DecompositionDiscriminator(config.ahead_by),
+        solution_discriminator=SolutionDiscriminator(config.ahead_by),
+        red_flag=RedFlagGuard(),
+        verifier=StateVerifier(),
+        logger=events,
+        metrics=metrics,
     )
 
-    result: Optional[RunResult] = None
+    orchestrator = MakerOrchestrator(runtime)
+    start = time.perf_counter()
     try:
-        result = run_swarm(
-            task=task,
-            config=config,
-            runtime=runtime,
-        )
+        result = orchestrator.run(task)
     except KeyboardInterrupt:
-        aborted_reason = "interrupted by user"
-        events.log("aborted", {"reason": aborted_reason}, message=aborted_reason)
-        display.log_event("Interrupted by user.")
-        langsmith.complete(error=aborted_reason)
-        run_stats = RunStats(
-            elapsed_s=time.perf_counter() - metrics.start_time,
-            llm_calls=metrics.llm_calls,
-            tokens_in=metrics.tokens_in,
-            tokens_out=metrics.tokens_out,
-            retries=metrics.retries,
-            consensus_votes=metrics.consensus_votes,
-            aborted_reason=aborted_reason,
-        )
-        artifacts = RunArtifacts(events_path=events_path, result_md_path=result_md_path, langsmith_run_url=langsmith.run_url)
-        result = RunResult(
-            task=task,
-            final_answer=None,
-            steps=list(runtime.history),
-            stats=run_stats,
-            artifacts=artifacts,
-        )
-    finally:
-        display.stop()
-
-    if result is None:
+        typer.echo("Interrupted by user.", err=True)
         raise typer.Exit(1)
+    finally:
+        elapsed = time.perf_counter() - start
+        typer.echo(f"Elapsed: {elapsed:.2f}s")
 
     result.artifacts.events_path = events_path
     result.artifacts.result_md_path = result_md_path
     result.artifacts.result_json_path = result_json_path
-    if not result.artifacts.langsmith_run_url:
-        result.artifacts.langsmith_run_url = langsmith.run_url
 
     save_json_result(result, result_json_path)
     save_markdown_result(result, result_md_path)
 
     typer.echo(f"Result saved to {result_json_path}")
-    if result.artifacts.langsmith_run_url:
-        typer.echo(f"LangSmith run: {result.artifacts.langsmith_run_url}")
+    typer.echo(f"Markdown summary: {result_md_path}")
