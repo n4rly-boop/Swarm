@@ -13,6 +13,7 @@ class ActionVerifier:
     def __init__(self) -> None:
         self._applied_signatures: set[str] = set()
         self._last_signature: Optional[str] = None
+        self._applied_contents: set[str] = set()  # Normalized content for deduplication
 
     def verify(
         self,
@@ -46,7 +47,11 @@ class ActionVerifier:
             if not isinstance(content, str) or not content.strip():
                 return False, "FINAL requires args.content as non-empty string"
         elif action_type == "NOTE":
-            pass
+            # Check for content duplication in domain state (anti-stagnation for small models)
+            if not dry_run:
+                content = action.args.get("content", "")
+                if content and self._is_duplicate_content(content, planner_step):
+                    return False, "duplicate content (this work was already completed in a previous step)"
         elif action_type == "ASK_CLARIFY":
             # ASK_CLARIFY is discouraged - only allow if args.content explains why it's truly needed
             content = action.args.get("content") or action.args.get("prompt")
@@ -57,17 +62,34 @@ class ActionVerifier:
         elif action_type == "DO":
             if not action.args:
                 return False, "DO requires non-empty args"
+            # Check for content duplication (anti-stagnation for small models)
+            if not dry_run:
+                content = action.args.get("content", "")
+                if content and self._is_duplicate_content(content, planner_step):
+                    return False, "duplicate content (this work was already completed in a previous step)"
         else:
             return False, f"unknown action_type: {action_type}"
 
         signature = action.signature
+
+        # Check for duplicates
         if signature == self._last_signature:
             return False, "duplicate signature (same as previous action)"
         if signature in self._applied_signatures:
             return False, "duplicate signature (loop prevention)"
 
-        self._last_signature = signature
-        self._applied_signatures.add(signature)
+        # Only track signatures during actual verification, not dry-run pre-validation
+        if not dry_run:
+            self._last_signature = signature
+            self._applied_signatures.add(signature)
+
+            # Track normalized content for duplicate detection
+            content = action.args.get("content", "")
+            if content:
+                normalized = self._normalize_content(content)
+                if len(normalized) >= 10:  # Only track substantial content
+                    self._applied_contents.add(normalized)
+
         return True, "dry-run accepted" if dry_run else "validated"
 
     def apply(self, action: Action, state: MutableMapping[str, object]) -> None:
@@ -89,6 +111,26 @@ class ActionVerifier:
 
     def applied_signatures(self) -> Iterable[str]:
         return tuple(self._applied_signatures)
+
+    def _normalize_content(self, content: str) -> str:
+        """Normalize content for duplicate detection (case-insensitive, punctuation-insensitive)."""
+        # Remove common variations that don't change meaning
+        normalized = content.lower().strip()
+        # Remove trailing punctuation
+        normalized = normalized.rstrip('.!,;:')
+        # Normalize whitespace
+        normalized = ' '.join(normalized.split())
+        return normalized
+
+    def _is_duplicate_content(self, content: str, planner_step: PlannerStep) -> bool:
+        """Check if this content was already submitted in a previous action."""
+        normalized = self._normalize_content(content)
+
+        # Skip very short content (likely just step descriptions)
+        if len(normalized) < 10:
+            return False
+
+        return normalized in self._applied_contents
 
     def _extract_content(self, args: Dict[str, object]) -> str:
         content = args.get("content")

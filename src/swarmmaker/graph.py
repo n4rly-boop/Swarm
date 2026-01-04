@@ -243,14 +243,26 @@ def plan_node(config: SwarmConfig):
 
             # Summarize domain state progress
             domain_summary = ""
+            already_completed = []
             if domain_state and hasattr(domain_state, "model_dump"):
                 domain_data = domain_state.model_dump()
                 # Compact representation
                 domain_summary = json.dumps(domain_data, ensure_ascii=False)[:500]  # Limit size
 
+                # Extract key accomplishments for planner awareness (prevents re-doing work)
+                if hasattr(domain_state, "equations") and domain_state.equations:
+                    already_completed.append(f"Equations: {', '.join(domain_state.equations[-3:])}")
+                if hasattr(domain_state, "solutions") and domain_state.solutions:
+                    already_completed.append(f"Solutions: {domain_state.solutions}")
+                if hasattr(domain_state, "intermediate_results") and domain_state.intermediate_results:
+                    # Add last few intermediate results
+                    for result in domain_state.intermediate_results[-2:]:
+                        already_completed.append(f"Completed: {result[:80]}")
+
             summary = {
                 "task": state["task"],
                 "domain_state_summary": domain_summary,
+                "already_completed": already_completed,
                 "draft_answer": draft,
                 "steps_completed": state.get("steps_completed", 0),
                 "history_signatures": state.get("history_signatures", [])[-5:],
@@ -266,6 +278,11 @@ def plan_node(config: SwarmConfig):
                 if task_analysis.strategy == OrchestrationStrategy.SINGLE_SHOT and step_id == 1:
                     force_done = True
 
+            # Format already_completed list for prompt
+            completed_str = ""
+            if already_completed:
+                completed_str = "\n\nWORK ALREADY COMPLETED (do NOT repeat these):\n" + "\n".join(f"  - {item}" for item in already_completed)
+
             planner_prompt = [
                 SystemMessage(
                     content=(
@@ -278,8 +295,11 @@ def plan_node(config: SwarmConfig):
                         "- Workers should be able to complete the step in 1-2 sentences with actual results\n"
                         "- Avoid compound goals like 'factor AND solve' - split into separate steps\n"
                         "- Prefer concrete goals with specific equations/values over abstract instructions\n"
-                        "- Good: 'Factor x²-7x+6 into two binomials' (shows actual factors)\n"
+                        "- Good: 'Set (x-1)=0 and solve for x' (one specific operation)\n"
                         "- Bad: 'Factor and solve the equation' (too many sub-tasks)\n\n"
+                        "CRITICAL: Do NOT ask workers to repeat work that's already completed!\n"
+                        "- Check the 'already_completed' list below\n"
+                        "- Ask for the NEXT logical step only\n\n"
                         + ("CRITICAL: This is a single-shot task - you MUST set stop_condition='done'.\n\n" if force_done else "")
                         + "Output ONLY the PlannerStep JSON. Never include chain-of-thought or commentary."
                     )
@@ -287,6 +307,7 @@ def plan_node(config: SwarmConfig):
                 HumanMessage(
                     content=(
                         f"Task: {state['task']}\n"
+                        f"{completed_str}\n"
                         f"Context summary:\n{json.dumps(summary, ensure_ascii=False, indent=2)}\n"
                         f"Choose worker_max_tokens <= {min(512, budget_remaining or 256)}."
                     )
@@ -808,18 +829,27 @@ def _voter_prompt(
 ) -> List[Any]:
     rationale_instruction = "Include rationale (<=1 sentence)." if show_rationale else "Do not include rationale."
 
-    # Summarize domain state for context
-    domain_summary = ""
-    if domain_state and hasattr(domain_state, "model_dump"):
-        domain_data = domain_state.model_dump()
-        domain_summary = json.dumps(domain_data, ensure_ascii=False)[:300]  # Compact
-    else:
-        domain_summary = "No progress yet"
-
-    draft_answer = json.dumps(draft, ensure_ascii=False)
-
     # Determine if FINAL is required
     final_required = planner_step.stop_condition == "done" or "final" in planner_step.step_goal.lower()
+
+    # DESIGN PRINCIPLE: Workers are stateless, single-purpose executors
+    # - For atomic steps: ONLY receive the step goal, no history
+    # - For finalization: Receive context to synthesize final answer
+
+    # Prepare context (ONLY for finalization)
+    if final_required:
+        # Summarize domain state for finalization
+        domain_summary = ""
+        if domain_state and hasattr(domain_state, "model_dump"):
+            domain_data = domain_state.model_dump()
+            domain_summary = json.dumps(domain_data, ensure_ascii=False)[:500]
+        else:
+            domain_summary = "No progress made yet"
+        draft_answer = draft or "None"
+    else:
+        # Atomic step: NO CONTEXT NEEDED
+        domain_summary = None
+        draft_answer = None
 
     if final_required:
         system_instructions = (
@@ -844,44 +874,52 @@ def _voter_prompt(
         )
     else:
         system_instructions = (
-            f"You are SwarmMaker worker #{voter_index}.\n"
-            "You MUST output ONLY valid JSON matching the Action schema.\n"
-            'Action schema:\n{ "step_id": int, "action_type": "NOTE"|"DO", "args": object'
-            + (', "rationale": string' if show_rationale else "")
-            + ', "confidence": number }\n'
+            f"You are a simple worker executing a single atomic task.\n"
+            "You do NOT have context about previous steps or the overall goal.\n"
+            "Your ONLY job: Perform the task you're given and return the result.\n\n"
+            "Output ONLY valid JSON matching this schema:\n"
+            '{ "step_id": int, "action_type": "NOTE"|"DO", "args": {"content": "..."}'
+            + (', "rationale": "..."' if show_rationale else "")
+            + ', "confidence": 0.0-1.0 }\n\n'
             "Rules:\n"
-            f"- step_id MUST equal {planner_step.step_id} exactly (copy this number).\n"
-            "- Choose action_type based on what you're doing:\n"
-            '  NOTE: Use when adding observations or intermediate findings.\n'
-            '  DO: Use when performing an action or computation.\n\n'
-            "- CRITICAL: Show ACTUAL WORK, not descriptions.\n"
-            "  GOOD examples:\n"
-            '    {{"action_type": "DO", "args": {{"content": "x^2 - 5x + 7 = 2x + 1, so x^2 - 7x + 6 = 0"}}}}\n'
-            '    {{"action_type": "NOTE", "args": {{"content": "Factoring: x^2 - 7x + 6 = (x-1)(x-6)"}}}}\n'
-            '    {{"action_type": "DO", "args": {{"content": "Solving (x-1)(x-6)=0 gives x=1 or x=6"}}}}\n'
-            "  BAD examples (TOO VAGUE - DO NOT DO THIS):\n"
-            '    {{"action_type": "DO", "args": {{"content": "Simplify the equation"}}}}\n'
-            '    {{"action_type": "NOTE", "args": {{"content": "I will factor the quadratic"}}}}\n'
-            '    {{"action_type": "DO", "args": {{"content": "Solve for x"}}}}\n\n'
-            "- Show equations, numbers, and results - not intentions or descriptions.\n"
-            "- Do NOT use ASK_CLARIFY unless you have truly missing information that prevents any progress.\n"
-            f"- {rationale_instruction}\n"
-            "- confidence should be between 0 and 1.\n"
-            "- No markdown formatting, no extra JSON keys.\n"
+            f"- step_id = {planner_step.step_id} (copy this exact number)\n"
+            "- Choose action_type:\n"
+            '  NOTE: Observation or finding\n'
+            '  DO: Performed computation or action\n\n'
+            "CRITICAL: Show ACTUAL RESULTS, not descriptions or plans.\n\n"
+            "GOOD - Shows actual work:\n"
+            f'  {{"step_id": {planner_step.step_id}, "action_type": "DO", "args": {{"content": "x^2 - 7x + 6 = 0"}}, "confidence": 0.95}}\n'
+            f'  {{"step_id": {planner_step.step_id}, "action_type": "NOTE", "args": {{"content": "(x-1)(x-6)"}}, "confidence": 0.9}}\n'
+            f'  {{"step_id": {planner_step.step_id}, "action_type": "DO", "args": {{"content": "x=1"}}, "confidence": 1.0}}\n\n'
+            "BAD - Vague descriptions (REJECTED):\n"
+            f'  {{"step_id": {planner_step.step_id}, "action_type": "DO", "args": {{"content": "Simplify the equation"}}}}\n'
+            f'  {{"step_id": {planner_step.step_id}, "action_type": "DO", "args": {{"content": "I will solve for x"}}}}\n\n'
+            "Remember: You are a simple executor. Just do the task and return the result.\n"
+            f"{rationale_instruction} Confidence between 0-1. No markdown, no extra keys."
+        )
+
+    # Build worker prompt based on mode
+    if final_required:
+        # Finalization: Provide context for synthesis
+        worker_task = (
+            f"Original task: {task}\n\n"
+            f"Your job: {planner_step.step_goal}\n\n"
+            f"Progress made so far:\n{domain_summary}\n\n"
+            f"Draft answer: {draft_answer}\n\n"
+            f"Synthesize a complete final answer using all the progress above."
+        )
+    else:
+        # Atomic step: ONLY the step goal, nothing else
+        # Worker is a simple executor - receives task, performs it, returns result
+        worker_task = (
+            f"Your task: {planner_step.step_goal}\n\n"
+            f"Perform this operation and return the result.\n"
+            f"Show actual work (equations, values, calculations) - NOT descriptions or intentions."
         )
 
     return [
         SystemMessage(content=system_instructions),
-        HumanMessage(
-            content=(
-                f"Task: {task}\n"
-                f"Step goal: {planner_step.step_goal}\n"
-                f"Stop condition: {planner_step.stop_condition}\n"
-                f"Progress so far: {domain_summary}\n"
-                f"Draft answer: {draft_answer}\n"
-                f"Style hint: {style_hint}\n"
-            )
-        ),
+        HumanMessage(content=worker_task),
     ]
 
 

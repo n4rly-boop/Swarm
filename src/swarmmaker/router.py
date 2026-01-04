@@ -147,7 +147,7 @@ class TaskRouter:
             schema_name="TaskClassification",
             schema=schema,
             parser=lambda x: x,
-            max_output_tokens=256,
+            max_output_tokens=1024,
         )
 
         return result.content

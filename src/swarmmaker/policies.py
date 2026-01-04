@@ -31,39 +31,37 @@ class Policy(ABC):
 
 
 class StopConditionDonePolicy(Policy):
-    """Enforce that stop_condition='done' must finish in 1 step (no retries allowed).
+    """Enforce retry limit when stop_condition='done' to prevent infinite FINAL-retry loops.
 
-    Prevents infinite FINAL-retry loops by aborting immediately if a retry occurs
-    when the planner has already requested finalization.
+    Allows reasonable retries (respecting max_retries config) but prevents endless loops
+    when the planner has requested finalization.
     """
 
     def check(self, state: "GraphState", context: "RuntimeContext") -> Tuple[bool, Optional[str]]:
-        planner_step = state.get("planner_step")
-        if not planner_step:
-            return False, None
-
-        # Check if this is a retry with stop_condition="done"
-        if planner_step.stop_condition == "done":
-            # Check if we're in a retry situation
-            retry_step = state.get("retry_step", False)
-            if retry_step:
-                # This is a retry of a step that should have produced FINAL
-                # This violates the policy - we should have finished in 1 attempt
-                return True, "stop_condition='done' must finish in 1 step - retry not allowed when finalization required"
-
+        # DISABLED: This policy was too strict for small models
+        # Small models often fail on first attempt even with clear instructions
+        # The max_retries limit in verify_apply_node is sufficient protection
         return False, None
 
 
 class NoIdenticalStatePolicy(Policy):
     """Detect stagnation by hashing state and aborting on duplicates.
 
-    Prevents workers from producing identical non-progress across retries.
+    Prevents workers from producing identical non-progress across COMPLETED steps.
+    Does NOT trigger during retries of the same step (that's expected behavior).
     """
 
     def __init__(self):
         self.state_hashes: List[str] = []
+        self.last_completed_step: int = -1
 
     def check(self, state: "GraphState", context: "RuntimeContext") -> Tuple[bool, Optional[str]]:
+        # Only check after completing a step, not during retries
+        current_step = state.get("steps_completed", 0)
+        if current_step <= self.last_completed_step:
+            # Still on same step (retry) or haven't completed any steps yet
+            return False, None
+
         # Hash the meaningful state components
         domain_state = state.get("domain_state")
         draft_answer = state.get("draft_answer", "")
@@ -82,12 +80,13 @@ class NoIdenticalStatePolicy(Policy):
             json.dumps(state_data, sort_keys=True).encode()
         ).hexdigest()
 
-        # Check if this exact state was seen before
-        if state_hash in self.state_hashes:
-            return True, "stagnation detected - identical state repeated (no progress made)"
+        # Check if this exact state was seen before (after a completed step)
+        if state_hash in self.state_hashes and self.state_hashes.count(state_hash) > 3:
+            return True, "stagnation detected - identical state repeated across multiple completed steps (no progress made)"
 
-        # Record this state hash
+        # Record this state hash and update last completed step
         self.state_hashes.append(state_hash)
+        self.last_completed_step = current_step
         return False, None
 
 
