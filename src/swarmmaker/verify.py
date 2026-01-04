@@ -2,6 +2,8 @@
 import json
 from typing import Dict, Iterable, MutableMapping, Optional, Tuple
 
+from .domain_state import MathState
+from .math_constraints import MathValidator
 from .schemas import Action, PlannerStep
 
 
@@ -34,37 +36,10 @@ class ActionVerifier:
         if planner_step.stop_condition == "done" and action_type != "FINAL":
             return False, "planner requested done -> must emit FINAL with args.content"
 
-        # Check for non-progressive content (workers just restating the goal)
-        content = action.args.get("content", "")
-        if isinstance(content, str) and content.strip():
-            content_lower = content.lower().strip()
-            goal_lower = planner_step.step_goal.lower().strip()
-
-            # Check if worker is just repeating the goal without actual work
-            vague_phrases = [
-                "i will",
-                "we will",
-                "should",
-                "need to",
-                "let's",
-                "going to",
-                "can we",
-                "we should",
-                "will factor",
-                "will solve",
-                "will simplify",
-                "will compute",
-            ]
-            if any(content_lower.startswith(phrase) for phrase in vague_phrases):
-                return False, f"action too vague - show actual work, not intentions (starts with '{content_lower.split()[0:2]}')"
-
-            # Check if content is suspiciously similar to the goal (likely just restating it)
-            if len(content_lower) < 80 and goal_lower in content_lower:
-                # If the content is short and contains the goal verbatim, it's probably not actual work
-                # Allow it if it has equations or specific values
-                has_math = any(char in content for char in "=+-*/^()0123456789")
-                if not has_math:
-                    return False, "action restates goal without showing actual work - include equations/calculations"
+        # Domain-specific validation (replaces string heuristics)
+        # Note: domain_state is passed via dry_run context during consensus pre-validation
+        # For normal verification, we skip domain validation here and rely on pre-validation
+        # This is because we don't have access to domain_state in this method signature
 
         if action_type == "FINAL":
             content = action.args.get("content")
@@ -99,22 +74,14 @@ class ActionVerifier:
         history = state.setdefault("history_signatures", [])
         if isinstance(history, list):
             history.append(action.signature)
-        notes = state.setdefault("notes", [])
-        if not isinstance(notes, list):
-            raise TypeError("state.notes must remain a list")
-        if action.action_type == "NOTE":
-            note = self._extract_content(action.args)
-            notes.append(note)
-        elif action.action_type == "DO":
-            description = action.args.get("description")
-            if isinstance(description, str) and description.strip():
-                notes.append(f"Did: {description.strip()}")
-            else:
-                notes.append(f"Did: {json.dumps(action.args, ensure_ascii=False)}")
-        elif action.action_type == "ASK_CLARIFY":
-            question = self._extract_content(action.args)
-            notes.append(f"Clarify: {question}")
-        elif action.action_type == "FINAL":
+
+        # Update domain state by merging action
+        domain_state = state.get("domain_state")
+        if domain_state and hasattr(domain_state, "merge"):
+            state["domain_state"] = domain_state.merge(action)
+
+        # Handle FINAL action
+        if action.action_type == "FINAL":
             content = self._extract_content(action.args)
             state["draft_answer"] = content
             state["final_answer"] = content

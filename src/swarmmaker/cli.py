@@ -11,9 +11,20 @@ import typer
 from .callbacks import LiveSwarmDisplay
 from .consensus import ConsensusEngine
 from .config import settings
+from .finalizer import BestEffortFinalizer
 from .graph import LangSmithManager, RuntimeContext, run_swarm
 from .io import EventLogger, ensure_log_dir, save_json_result, save_markdown_result
 from .llm import LLMClient, MetricsTracker
+from .policies import (
+    ASKClarifyTerminationPolicy,
+    BudgetAwareStrategyPolicy,
+    MaxDecompositionDepthPolicy,
+    NoIdenticalStatePolicy,
+    PolicyEngine,
+    StopConditionDonePolicy,
+)
+from .progress import ProgressTracker
+from .router import TaskRouter
 from .schemas import (
     RunArtifacts,
     RunResult,
@@ -22,6 +33,7 @@ from .schemas import (
     SwarmConfig,
     canonical_json,
 )
+from .termination import TerminationAuthority
 from .verify import ActionVerifier
 
 app = typer.Typer(add_completion=False, help="SwarmMaker multi-agent CLI.")
@@ -119,13 +131,28 @@ def main(
         stream=config.stream,
         dry_run=config.dry_run,
     )
-    consensus = ConsensusEngine(config.ahead_by)
     verifier = ActionVerifier()
+    consensus = ConsensusEngine(config.ahead_by, verifier=verifier)
     langsmith = LangSmithManager(
         enabled=bool(os.environ.get("LANGSMITH_API_KEY")),
         project_name=config.project_name,
         task=task,
     )
+
+    # Initialize new system components
+    router = TaskRouter(llm_client, config)
+    policy_engine = PolicyEngine()
+    progress = ProgressTracker()
+    termination = TerminationAuthority(config)
+    finalizer = BestEffortFinalizer(llm_client, config)
+
+    # Register all policies
+    policy_engine.register(StopConditionDonePolicy())
+    policy_engine.register(NoIdenticalStatePolicy())
+    policy_engine.register(ASKClarifyTerminationPolicy())
+    policy_engine.register(MaxDecompositionDepthPolicy())
+    policy_engine.register(BudgetAwareStrategyPolicy())
+
     runtime = RuntimeContext(
         llm=llm_client,
         consensus=consensus,
@@ -136,6 +163,11 @@ def main(
         langsmith=langsmith,
         config=config,
         history=[],
+        router=router,
+        policy_engine=policy_engine,
+        progress=progress,
+        termination=termination,
+        finalizer=finalizer,
     )
 
     result: Optional[RunResult] = None

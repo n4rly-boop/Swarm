@@ -73,7 +73,7 @@ class StepRecord(BaseModel):
     judge_used: bool = False
     retries: int = 0
     verifier_passed: bool = False
-    notes_snapshot: List[str] = Field(default_factory=list)
+    domain_state_snapshot: Optional[Dict[str, Any]] = None  # Serialized domain state
     draft_answer: Optional[str] = None
     final_answer: Optional[str] = None
 
