@@ -343,17 +343,30 @@ def voters_node(config: SwarmConfig):
                 config.show_rationale,
                 style_hint,
             )
-            action_result = _request_json(
-                runtime.llm,
-                voter_messages,
-                meta=meta,
-                model=config.model_worker,
-                temperature=config.temperature_worker,
-                parser=Action.model_validate,
-                output_schema=Action.model_json_schema(),
-                runtime=runtime,
-                max_output_tokens=worker_token_cap,
-            )
+            try:
+                action_result = _request_json(
+                    runtime.llm,
+                    voter_messages,
+                    meta=meta,
+                    model=config.model_worker,
+                    temperature=config.temperature_worker,
+                    parser=Action.model_validate,
+                    output_schema=Action.model_json_schema(),
+                    runtime=runtime,
+                    max_output_tokens=worker_token_cap,
+                )
+            except Exception as err:
+                runtime.metrics.increment_retry()
+                runtime.events.log(
+                    "worker_failed",
+                    {
+                        "voter_id": idx,
+                        "step_id": planner_step.step_id,
+                        "error": str(err),
+                    },
+                )
+                runtime.display.set_panel_text(stage, f"Worker failed after retries: {err}")
+                continue
             action = action_result.content
             runtime.display.set_panel_text(
                 stage,
@@ -789,14 +802,30 @@ def _request_json(
     base_messages = [schema_directive, *messages]
     prompt_messages = list(base_messages)
     for attempt in range(attempts):
-        text = llm.complete(
-            prompt_messages,
-            meta=meta,
-            model=model,
-            temperature=temperature,
-            response_format=response_format,
-            max_output_tokens=max_output_tokens,
-        )
+        try:
+            text = llm.complete(
+                prompt_messages,
+                meta=meta,
+                model=model,
+                temperature=temperature,
+                response_format=response_format,
+                max_output_tokens=max_output_tokens,
+            )
+        except Exception as err:
+            runtime.metrics.increment_retry()
+            runtime.events.log(
+                "llm_call_error",
+                {
+                    "agent": meta.agent,
+                    "stage": meta.stage,
+                    "error": str(err),
+                },
+            )
+            if attempt == attempts - 1:
+                raise
+            runtime.display.log_event(f"LLM error from {meta.agent}: {err}. Retrying.")
+            prompt_messages = list(base_messages)
+            continue
         try:
             payload = _extract_json_payload(text)
             structured = StructuredLLMOutput.model_validate_json(payload)
