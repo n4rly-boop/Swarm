@@ -26,11 +26,12 @@ class Decomposer:
                     content=(
                         "You are a MAKER decomposition specialist.\n"
                         "Break the task into TWO smaller subproblems with a clear compose function.\n"
-                        "If the task is already atomic, set is_atomic=true and describe why.\n"
+                        "If the task is already atomic, set is_atomic=true and explain briefly.\n"
                         "Rules:\n"
-                        "- subproblem_a & subproblem_b must be concrete, independently solvable tasks\n"
-                        "- compose_fn must explain EXACTLY how to combine their answers\n"
-                        "- NEVER mention chain-of-thought; output structured JSON only"
+                        "- subproblem_a & subproblem_b must reduce the original task (no tautologies or restating givens)\n"
+                        "- NEVER output 'solve y=... for y' or similar useless steps\n"
+                        "- compose_fn must explain EXACTLY how to combine their answers without extra prose\n"
+                        "- Keep each field concise; no chain-of-thought; respond with JSON only"
                     )
                 ),
                 HumanMessage(

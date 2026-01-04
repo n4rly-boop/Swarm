@@ -1,9 +1,10 @@
 """Simple CLI reporter for tracking MAKER progress."""
 from __future__ import annotations
 
-from typing import Callable, Dict
+import hashlib
+from typing import Any, Callable, Dict
 
-from .schemas import SwarmConfig
+from .schemas import SwarmConfig, TaskState, canonical_json
 
 
 class RunReporter:
@@ -45,3 +46,37 @@ class RunReporter:
             f"| steps logged: {int(snapshot.get('steps', 0))} "
             f"| budget remaining: {int(snapshot.get('budget_remaining', 0))}"
         )
+
+
+class ProgressTracker:
+    """Tracks whether the run state is making meaningful progress."""
+
+    def __init__(self, *, max_stagnant_rounds: int) -> None:
+        self.max_stagnant_rounds = max_stagnant_rounds
+        self._last_hash = ""
+        self._stagnant_rounds = 0
+
+    def record(self, state: TaskState) -> Dict[str, Any]:
+        payload = {
+            "facts": {key: fact.solution for key, fact in state.facts.items()},
+            "draft": state.draft_answer,
+            "notes": state.notes[-5:],
+            "solved": state.solved_subproblems.copy(),
+        }
+        digest = hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+        changed = digest != self._last_hash
+        if changed:
+            self._last_hash = digest
+            self._stagnant_rounds = 0
+            state.progress_version += 1
+        else:
+            self._stagnant_rounds += 1
+        state.progress_hash = digest
+        return {"changed": changed, "hash": digest, "stagnant": self._stagnant_rounds}
+
+    def stagnant(self) -> bool:
+        return self._stagnant_rounds >= self.max_stagnant_rounds
+
+    def reset(self) -> None:
+        self._last_hash = ""
+        self._stagnant_rounds = 0

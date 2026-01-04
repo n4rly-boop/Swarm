@@ -6,7 +6,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Generic, List, Literal, Optional, TypeVar
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 def canonical_json(obj: Any) -> str:
@@ -32,6 +32,8 @@ class StructuredMode(str, Enum):
 class DecompositionProposal(BaseModel):
     """LLM-proposed decomposition of a problem into two subproblems."""
 
+    model_config = ConfigDict(extra="forbid")
+
     subproblem_a: str = Field(min_length=1, description="First subproblem to solve.")
     subproblem_b: str = Field(min_length=1, description="Second subproblem to solve.")
     compose_fn: str = Field(min_length=1, description="Instructions to combine results.")
@@ -55,6 +57,8 @@ class DecompositionProposal(BaseModel):
 class AtomicSolution(BaseModel):
     """Atomic solver output containing the proposed answer."""
 
+    model_config = ConfigDict(extra="forbid")
+
     solution: str = Field(min_length=1, description="Candidate solution string.")
     confidence: float = Field(ge=0.0, le=1.0)
     work_shown: str = Field(min_length=1, description="Audit trail for the answer.")
@@ -64,14 +68,61 @@ class AtomicSolution(BaseModel):
         return canonical_json({"solution": self.solution.strip()})
 
 
+class ProblemFact(BaseModel):
+    """Compact fact captured from an accepted atomic solution."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    problem: str
+    solution: str
+    work_shown: str
+    confidence: float = Field(ge=0.0, le=1.0)
+    depth: int = 0
+
+
+class SupportPoint(BaseModel):
+    """Structured support point describing a computed result."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    label: str
+    values: Dict[str, float] = Field(default_factory=dict)
+    statement: Optional[str] = None
+
+
+class FinalSupport(BaseModel):
+    """Optional support payload carried with the final answer."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    summary: Optional[str] = None
+    equations: List[str] = Field(default_factory=list)
+    points: List[SupportPoint] = Field(default_factory=list)
+
+
+class FinalAnswer(BaseModel):
+    """Final answer payload returned by the composer stage."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    answer: str = Field(min_length=1, description="Direct response to the original task.")
+    confidence: float = Field(ge=0.0, le=1.0)
+    support: Optional[FinalSupport] = None
+
+
 class TaskState(BaseModel):
     """Minimal state snapshot shared with the orchestrator."""
 
     task: str
     decomposition_tree: Dict[str, Any] = Field(default_factory=dict)
     solved_subproblems: Dict[str, str] = Field(default_factory=dict)
+    facts: Dict[str, ProblemFact] = Field(default_factory=dict)
     current_problem: str
     depth: int = 0
+    notes: List[str] = Field(default_factory=list)
+    draft_answer: Optional[str] = None
+    progress_version: int = 0
+    progress_hash: str = ""
 
 
 class StepTrace(BaseModel):
@@ -108,6 +159,7 @@ class RunArtifacts(BaseModel):
 class RunResult(BaseModel):
     task: str
     final_answer: Optional[str]
+    final_payload: Optional[FinalAnswer] = None
     steps: List[StepTrace]
     stats: RunStats
     artifacts: RunArtifacts
@@ -119,17 +171,29 @@ class SwarmConfig(BaseModel):
 
     model_decomposer: str
     model_solver: str
+    model_composer: Optional[str] = None
     batch_size: int = 5
     ahead_by: int = 2
     max_rounds: int = 10
     max_depth: int = 6
+    prefer_atomic_min_samples: int = 3
+    prefer_atomic_ratio: float = 0.5
     max_total_tokens: int = 50_000
     timeout_seconds: int = 60
     temperature_decomposer: float = 0.3
     temperature_solver: float = 0.8
+    temperature_composer: float = 0.2
     dry_run: bool = False
     log_dir: Path = Field(default_factory=lambda: Path("runs"))
     structured_mode: StructuredMode = StructuredMode.json_schema
+    max_stagnant_rounds: int = 2
+    max_non_final_steps: int = 4
+    max_work_shown_chars: int = 1200
+    direct_attempt_batch_size: int = 2
+    direct_attempt_rounds: int = 1
+    stagnation_temperature_scale: float = 0.6
+    progress_summary_limit: int = 5
+    state_summary_char_limit: int = 1200
 
 
 @dataclass

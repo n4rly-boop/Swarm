@@ -1,7 +1,7 @@
 """Atomic solver agents."""
 from __future__ import annotations
 
-from typing import List
+from typing import List, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -17,7 +17,14 @@ class AtomicSolver:
         self.config = config
         self.schema = AtomicSolution.model_json_schema()
 
-    def solve(self, problem: str, step_id: int, batch_size: int) -> List[AtomicSolution]:
+    def solve(
+        self,
+        problem: str,
+        step_id: int,
+        batch_size: int,
+        *,
+        temperature: Optional[float] = None,
+    ) -> List[AtomicSolution]:
         candidates: List[AtomicSolution] = []
         for idx in range(batch_size):
             meta = AgentCallMeta(agent="solver", stage=f"solve#{idx}", step_id=step_id, voter_id=idx)
@@ -26,6 +33,7 @@ class AtomicSolver:
                     content=(
                         "You are an atomic problem solver.\n"
                         "Solve ONLY the problem provided. Show actual work in work_shown.\n"
+                        "Limit work_shown to <=8 short lines of math and omit any meta commentary.\n"
                         "Respond strictly with AtomicSolution JSON."
                     )
                 ),
@@ -40,7 +48,7 @@ class AtomicSolver:
                 messages,
                 meta=meta,
                 model=self.config.model_solver,
-                temperature=self.config.temperature_solver,
+                temperature=temperature or self.config.temperature_solver,
                 schema_name="AtomicSolution",
                 schema=self.schema,
                 parser=AtomicSolution.model_validate,

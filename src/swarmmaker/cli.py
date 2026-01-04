@@ -6,13 +6,14 @@ from typing import Optional
 
 import typer
 
+from .composer import FinalComposer
 from .config import settings
 from .decomposer import Decomposer
 from .discriminator import DecompositionDiscriminator, SolutionDiscriminator
 from .io import EventLogger, ensure_log_dir, save_json_result, save_markdown_result
 from .llm import LLMClient, MetricsTracker
 from .orchestrator import MakerOrchestrator, MakerRuntime
-from .progress import RunReporter
+from .progress import ProgressTracker, RunReporter
 from .red_flag import RedFlagGuard
 from .schemas import (
     RunArtifacts,
@@ -23,7 +24,7 @@ from .schemas import (
     canonical_json,
 )
 from .solver import AtomicSolver
-from .verify import StateVerifier
+from .verify import GlobalVerifier, StateVerifier
 
 app = typer.Typer(add_completion=False, help="SwarmMaker MAKER orchestrator CLI.")
 
@@ -102,6 +103,11 @@ def main(
 
     reporter = RunReporter(emit=typer.echo)
     reporter.start(task, config)
+    verifier = StateVerifier(
+        max_work_shown_chars=config.max_work_shown_chars,
+        max_facts=config.progress_summary_limit,
+    )
+    progress_tracker = ProgressTracker(max_stagnant_rounds=config.max_stagnant_rounds)
 
     runtime = MakerRuntime(
         config=config,
@@ -110,9 +116,12 @@ def main(
         decomposition_discriminator=DecompositionDiscriminator(config.ahead_by),
         solution_discriminator=SolutionDiscriminator(config.ahead_by),
         red_flag=RedFlagGuard(),
-        verifier=StateVerifier(),
+        verifier=verifier,
+        global_verifier=GlobalVerifier(),
+        composer=FinalComposer(llm_client, config),
         logger=events,
         metrics=metrics,
+        progress_tracker=progress_tracker,
         reporter=reporter,
     )
 
