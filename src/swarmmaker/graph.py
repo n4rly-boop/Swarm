@@ -588,7 +588,7 @@ def run_swarm(*, task: str, config: SwarmConfig, runtime: RuntimeContext) -> Run
         "retry_step": False,
     }
     compiled = graph.compile()
-    final_state = asyncio.run(compiled.ainvoke(initial_state))
+    final_state = asyncio.run(compiled.ainvoke(initial_state, config={"recursion_limit": 100}))
     stats_snapshot = runtime.metrics.snapshot(final_state.get("steps_completed", 0))
     run_stats = RunStats(
         elapsed_s=stats_snapshot.get("elapsed", 0.0),

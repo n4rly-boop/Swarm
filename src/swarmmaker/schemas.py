@@ -15,6 +15,8 @@ def canonical_json(obj: Any) -> str:
     def default(o: Any) -> Any:
         if isinstance(o, Path):
             return str(o)
+        if isinstance(o, datetime):
+            return o.isoformat()
         raise TypeError(f"Object of type {o.__class__.__name__} is not JSON serializable")
 
     return json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=default)
