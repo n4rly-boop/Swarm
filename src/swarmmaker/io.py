@@ -30,6 +30,7 @@ class EventLogger:
         stage: Optional[str] = None,
         signature: Optional[str] = None,
         message: Optional[str] = None,
+        model: Optional[str] = None,
     ) -> None:
         entry = {
             "timestamp": datetime.utcnow().isoformat(),
@@ -39,6 +40,7 @@ class EventLogger:
             "stage": stage,
             "signature": signature,
             "message": message,
+            "model": model,
             "payload": payload or {},
         }
         with self.path.open("a", encoding="utf-8") as handle:

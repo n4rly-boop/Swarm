@@ -34,12 +34,51 @@ class ActionVerifier:
         if planner_step.stop_condition == "done" and action_type != "FINAL":
             return False, "planner requested done -> must emit FINAL with args.content"
 
+        # Check for non-progressive content (workers just restating the goal)
+        content = action.args.get("content", "")
+        if isinstance(content, str) and content.strip():
+            content_lower = content.lower().strip()
+            goal_lower = planner_step.step_goal.lower().strip()
+
+            # Check if worker is just repeating the goal without actual work
+            vague_phrases = [
+                "i will",
+                "we will",
+                "should",
+                "need to",
+                "let's",
+                "going to",
+                "can we",
+                "we should",
+                "will factor",
+                "will solve",
+                "will simplify",
+                "will compute",
+            ]
+            if any(content_lower.startswith(phrase) for phrase in vague_phrases):
+                return False, f"action too vague - show actual work, not intentions (starts with '{content_lower.split()[0:2]}')"
+
+            # Check if content is suspiciously similar to the goal (likely just restating it)
+            if len(content_lower) < 80 and goal_lower in content_lower:
+                # If the content is short and contains the goal verbatim, it's probably not actual work
+                # Allow it if it has equations or specific values
+                has_math = any(char in content for char in "=+-*/^()0123456789")
+                if not has_math:
+                    return False, "action restates goal without showing actual work - include equations/calculations"
+
         if action_type == "FINAL":
             content = action.args.get("content")
             if not isinstance(content, str) or not content.strip():
                 return False, "FINAL requires args.content as non-empty string"
-        elif action_type in ("NOTE", "ASK_CLARIFY"):
+        elif action_type == "NOTE":
             pass
+        elif action_type == "ASK_CLARIFY":
+            # ASK_CLARIFY is discouraged - only allow if args.content explains why it's truly needed
+            content = action.args.get("content") or action.args.get("prompt")
+            if not isinstance(content, str) or not content.strip():
+                return False, "ASK_CLARIFY requires args.content or args.prompt with explanation"
+            # Log a warning that this action type is discouraged
+            return True, "ASK_CLARIFY accepted but discouraged (consider using NOTE instead)"
         elif action_type == "DO":
             if not action.args:
                 return False, "DO requires non-empty args"

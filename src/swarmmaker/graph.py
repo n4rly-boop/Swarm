@@ -209,7 +209,14 @@ def plan_node(config: SwarmConfig):
                     "You are the SwarmMaker planner coordinating specialist workers.\n"
                     "If the task can be answered now based on the notes and draft answer, "
                     'set stop_condition="done" and step_goal="produce final answer".\n'
-                    "Otherwise specify the single next goal the workers should execute.\n"
+                    "Otherwise specify the single next goal the workers should execute.\n\n"
+                    "IMPORTANT: Create GRANULAR, ATOMIC steps that require minimal computation.\n"
+                    "- Each step should do ONE specific thing (e.g., 'simplify 2x+1=x²-5x+7 to x²-7x+6=0')\n"
+                    "- Workers should be able to complete the step in 1-2 sentences with actual results\n"
+                    "- Avoid compound goals like 'factor AND solve' - split into separate steps\n"
+                    "- Prefer concrete goals with specific equations/values over abstract instructions\n"
+                    "- Good: 'Factor x²-7x+6 into two binomials' (shows actual factors)\n"
+                    "- Bad: 'Factor and solve the equation' (too many sub-tasks)\n\n"
                     "Output ONLY the PlannerStep JSON. Never include chain-of-thought or commentary."
                 )
             ),
@@ -239,6 +246,7 @@ def plan_node(config: SwarmConfig):
             step_id=planner_step.step_id,
             agent="planner",
             stage="plan",
+            model=config.model_planner,
         )
         runtime.display.set_panel_text("PLANNER", json.dumps(planner_step.model_dump(), ensure_ascii=False, indent=2))
         record = StepRecord(
@@ -271,6 +279,7 @@ def propose_node(config: SwarmConfig):
         votes: Dict[str, int] = {}
         lock = asyncio.Lock()
         stop_event = asyncio.Event()
+        final_required = planner_step.stop_condition == "done" or "final" in planner_step.step_goal.lower()
         style_pool = [
             "check arithmetic carefully",
             "summarize existing notes",
@@ -317,9 +326,32 @@ def propose_node(config: SwarmConfig):
                     step_id=planner_step.step_id,
                     agent=meta.agent,
                     stage=stage,
+                    model=config.model_worker,
                 )
                 return
             action = result.content
+            if final_required and action.action_type != "FINAL":
+                runtime.events.log(
+                    "worker_invalid_final",
+                    {"action": action.model_dump()},
+                    step_id=planner_step.step_id,
+                    agent=meta.agent,
+                    stage=stage,
+                    signature=action.signature,
+                    model=config.model_worker,
+                )
+                runtime.display.log_event("Worker failed to produce FINAL answer; retrying.")
+                return
+            # Log individual worker action for traceability
+            runtime.events.log(
+                "worker_action",
+                {"action": action.model_dump()},
+                step_id=planner_step.step_id,
+                agent=meta.agent,
+                stage=stage,
+                signature=action.signature,
+                model=config.model_worker,
+            )
             runtime.display.set_panel_text(stage, json.dumps(action.model_dump(), ensure_ascii=False, indent=2))
             async with lock:
                 actions.append(action)
@@ -339,13 +371,20 @@ def propose_node(config: SwarmConfig):
                 await asyncio.gather(*pending, return_exceptions=True)
                 break
         await asyncio.gather(*tasks, return_exceptions=True)
+        if final_required and not actions:
+            state["retry_step"] = True
+            runtime.display.log_event("Final answer required but no worker produced FINAL action.")
+            # Note: retry count is incremented in verify_apply_node to avoid double counting
+            return state
         runtime.metrics.add_votes(sum(votes.values()))
         runtime.display.set_panel_text("AGGREGATE", json.dumps({"votes": votes}, ensure_ascii=False))
         runtime.events.log(
             "voter_batch",
             {"count": len(actions), "votes": votes},
             step_id=planner_step.step_id,
+            agent="workers",
             stage="propose",
+            model=config.model_worker,
         )
         state["candidates"] = actions
         state["votes"] = votes
@@ -408,8 +447,10 @@ def aggregate_node(config: SwarmConfig):
                 "judge_choice",
                 {"selected_signature": signature},
                 step_id=planner_step.step_id,
+                agent="judge",
                 stage="judge",
                 signature=signature,
+                model=config.model_judge,
             )
             _update_history(
                 state,
@@ -489,7 +530,9 @@ def _call_judge(state: GraphState, candidates: Sequence[Action], config: SwarmCo
             "judge_error",
             {"error": str(err)},
             step_id=planner_step.step_id,
+            agent="judge",
             stage="judge",
+            model=config.model_judge,
         )
         return None
 
@@ -624,26 +667,61 @@ def _voter_prompt(
     rationale_instruction = "Include rationale (<=1 sentence)." if show_rationale else "Do not include rationale."
     recent_notes = json.dumps(list(notes)[-5:], ensure_ascii=False)
     draft_answer = json.dumps(draft, ensure_ascii=False)
+
+    # Determine if FINAL is required
+    final_required = planner_step.stop_condition == "done" or "final" in planner_step.step_goal.lower()
+
+    if final_required:
+        system_instructions = (
+            f"You are SwarmMaker worker #{voter_index}.\n"
+            "CRITICAL: The planner has set stop_condition='done' - you MUST produce a FINAL answer.\n"
+            "You MUST output ONLY valid JSON matching the Action schema with action_type='FINAL'.\n"
+            'Action schema format:\n'
+            f'  {{"step_id": {planner_step.step_id}, "action_type": "FINAL", '
+            '"args": {"content": "..."}'
+            + (', "rationale": "..."' if show_rationale else "")
+            + ', "confidence": 0.95}\n'
+            "Rules:\n"
+            f"- step_id MUST be exactly {planner_step.step_id} (copy this number exactly).\n"
+            "- action_type MUST be 'FINAL' - any other type will be REJECTED.\n"
+            "- args.content MUST contain your complete, detailed answer to the original task.\n"
+            "- Include ALL actual work, calculations, reasoning, and final results in args.content.\n"
+            "- Use the notes and context to synthesize a comprehensive final answer.\n"
+            "- Do NOT use placeholder text - provide the real, complete answer.\n"
+            f"- {rationale_instruction}\n"
+            "- confidence should be a number between 0 and 1.\n"
+            "- No markdown formatting in the JSON, no extra keys.\n"
+        )
+    else:
+        system_instructions = (
+            f"You are SwarmMaker worker #{voter_index}.\n"
+            "You MUST output ONLY valid JSON matching the Action schema.\n"
+            'Action schema:\n{ "step_id": int, "action_type": "NOTE"|"DO", "args": object'
+            + (', "rationale": string' if show_rationale else "")
+            + ', "confidence": number }\n'
+            "Rules:\n"
+            f"- step_id MUST equal {planner_step.step_id} exactly (copy this number).\n"
+            "- Choose action_type based on what you're doing:\n"
+            '  NOTE: Use when adding observations or intermediate findings.\n'
+            '  DO: Use when performing an action or computation.\n\n'
+            "- CRITICAL: Show ACTUAL WORK, not descriptions.\n"
+            "  GOOD examples:\n"
+            '    {{"action_type": "DO", "args": {{"content": "x^2 - 5x + 7 = 2x + 1, so x^2 - 7x + 6 = 0"}}}}\n'
+            '    {{"action_type": "NOTE", "args": {{"content": "Factoring: x^2 - 7x + 6 = (x-1)(x-6)"}}}}\n'
+            '    {{"action_type": "DO", "args": {{"content": "Solving (x-1)(x-6)=0 gives x=1 or x=6"}}}}\n'
+            "  BAD examples (TOO VAGUE - DO NOT DO THIS):\n"
+            '    {{"action_type": "DO", "args": {{"content": "Simplify the equation"}}}}\n'
+            '    {{"action_type": "NOTE", "args": {{"content": "I will factor the quadratic"}}}}\n'
+            '    {{"action_type": "DO", "args": {{"content": "Solve for x"}}}}\n\n'
+            "- Show equations, numbers, and results - not intentions or descriptions.\n"
+            "- Do NOT use ASK_CLARIFY unless you have truly missing information that prevents any progress.\n"
+            f"- {rationale_instruction}\n"
+            "- confidence should be between 0 and 1.\n"
+            "- No markdown formatting, no extra JSON keys.\n"
+        )
+
     return [
-        SystemMessage(
-            content=(
-                f"You are SwarmMaker worker #{voter_index}.\n"
-                "You MUST output ONLY valid JSON matching the Action schema.\n"
-                'Action schema:\n{ "step_id": int, "action_type": "FINAL"|"NOTE"|"ASK_CLARIFY"|"DO", "args": object'
-                + (', "rationale": string' if show_rationale else "")
-                + ', "confidence": number }\n'
-                "Rules:\n"
-                f"- step_id MUST equal {planner_step.step_id} exactly.\n"
-                "- If stop_condition is 'done' OR step_goal asks for final answer: output action_type='FINAL' "
-                'with args={"content": <final answer string>}.\n'
-                "- Otherwise:\n"
-                '  NOTE: args may be empty or include {"content": "..."}\n'
-                '  ASK_CLARIFY: args={"prompt":"..."}\n'
-                "  DO: args must be non-empty\n"
-                f"- {rationale_instruction}\n"
-                "- No markdown, no extra keys."
-            )
-        ),
+        SystemMessage(content=system_instructions),
         HumanMessage(
             content=(
                 f"Task: {task}\n"
