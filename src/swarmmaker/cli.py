@@ -12,6 +12,7 @@ from .discriminator import DecompositionDiscriminator, SolutionDiscriminator
 from .io import EventLogger, ensure_log_dir, save_json_result, save_markdown_result
 from .llm import LLMClient, MetricsTracker
 from .orchestrator import MakerOrchestrator, MakerRuntime
+from .progress import RunReporter
 from .red_flag import RedFlagGuard
 from .schemas import (
     RunArtifacts,
@@ -27,7 +28,7 @@ from .verify import StateVerifier
 app = typer.Typer(add_completion=False, help="SwarmMaker MAKER orchestrator CLI.")
 
 DEFAULT_DECOMPOSER_MODEL = "google/gemini-2.5-flash-preview-09-2025"
-DEFAULT_SOLVER_MODEL = "qwen/qwen2.5-7b-instruct"
+DEFAULT_SOLVER_MODEL = "qwen/qwen-2.5-7b-instruct"
 DEFAULT_DISCRIMINATOR_MODEL = "google/gemini-2.5-flash-preview-09-2025"
 
 
@@ -92,7 +93,7 @@ def main(
     typer.echo(f"Configuration: {canonical_json(config.model_dump(mode='python'))}")
 
     events = EventLogger(events_path)
-    events.log("task", {"task": task}, message="task received")
+    events.log("task", {"task": task}, message="task received", agent="orchestrator")
 
     metrics = MetricsTracker(config.max_total_tokens)
     llm_client = LLMClient(
@@ -104,6 +105,9 @@ def main(
         dry_run=config.dry_run,
     )
 
+    reporter = RunReporter(emit=typer.echo)
+    reporter.start(task, config)
+
     runtime = MakerRuntime(
         config=config,
         decomposer=Decomposer(llm_client, config),
@@ -114,6 +118,7 @@ def main(
         verifier=StateVerifier(),
         logger=events,
         metrics=metrics,
+        reporter=reporter,
     )
 
     orchestrator = MakerOrchestrator(runtime)

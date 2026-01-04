@@ -9,6 +9,7 @@ from .decomposer import Decomposer
 from .discriminator import DecompositionDiscriminator, SolutionDiscriminator
 from .io import EventLogger
 from .llm import MetricsTracker
+from .progress import RunReporter
 from .red_flag import RedFlagGuard
 from .schemas import (
     AtomicSolution,
@@ -35,6 +36,7 @@ class MakerRuntime:
     verifier: StateVerifier
     logger: EventLogger
     metrics: MetricsTracker
+    reporter: Optional[RunReporter] = None
 
 
 class MakerOrchestrator:
@@ -49,6 +51,7 @@ class MakerOrchestrator:
     def run(self, task: str) -> RunResult:
         self.task_state = TaskState(task=task, current_problem=task)
         start = time.perf_counter()
+        self._reporter_info(f"Starting task: {task}")
         final_answer = self._solve_problem(task, depth=0)
         elapsed = time.perf_counter() - start
         stats = RunStats(
@@ -96,12 +99,15 @@ class MakerOrchestrator:
 
     def _run_decomposition(self, problem: str, depth: int) -> Tuple[Optional[DecompositionProposal], StepTrace]:
         step_id = self._next_step_id()
+        self._report_step(step_id, "decomposition", problem, depth)
         trace = StepTrace(step_id=step_id, kind="decomposition", problem=problem, depth=depth)
         self.runtime.logger.log(
             "decomposition_start",
             {"problem": problem, "depth": depth},
             step_id=step_id,
             stage="decomposition",
+            agent="orchestrator",
+            model=self.runtime.config.model_decomposer,
         )
         proposals: List[DecompositionProposal] = []
         outcome = None
@@ -117,6 +123,8 @@ class MakerOrchestrator:
                 {"votes": outcome.votes, "count": len(proposals)},
                 step_id=step_id,
                 stage="decomposition",
+                agent="discriminator",
+                model=self.runtime.config.model_discriminator,
             )
             if outcome.winner:
                 trace.chosen = outcome.winner.model_dump()
@@ -126,7 +134,10 @@ class MakerOrchestrator:
                         {"proposal": outcome.winner.model_dump(), "confident": outcome.confident},
                         step_id=step_id,
                         stage="decomposition",
+                        agent="discriminator",
+                        model=self.runtime.config.model_discriminator,
                     )
+                    self._reporter_info("Decomposition consensus reached.")
                     break
         else:
             # Max rounds exhausted - pick best available proposal (may be None)
@@ -140,9 +151,12 @@ class MakerOrchestrator:
                     {"proposal": outcome.winner.model_dump(), "confident": False},
                     step_id=step_id,
                     stage="decomposition",
+                    agent="discriminator",
+                    model=self.runtime.config.model_discriminator,
                 )
 
         self.step_traces.append(trace)
+        self._report_metrics()
         return ((outcome.winner if outcome and outcome.winner else None), trace)
 
     def _solve_atomic(self, problem: str, depth: int, *, forced: bool) -> str:
@@ -151,12 +165,15 @@ class MakerOrchestrator:
         state = self.task_state
 
         step_id = self._next_step_id()
+        self._report_step(step_id, "atomic", problem, depth)
         trace = StepTrace(step_id=step_id, kind="atomic", problem=problem, depth=depth)
         self.runtime.logger.log(
             "atomic_start",
             {"problem": problem, "depth": depth, "forced": forced},
             step_id=step_id,
             stage="atomic",
+            agent="orchestrator",
+            model=self.runtime.config.model_solver,
         )
         accepted: List[AtomicSolution] = []
         rejections: List[dict] = []
@@ -177,6 +194,8 @@ class MakerOrchestrator:
                         reason,
                         step_id=step_id,
                         stage="atomic",
+                        agent="red_flag",
+                        model=self.runtime.config.model_solver,
                     )
                     continue
                 ok, msg = self.runtime.verifier.verify_solution(candidate)
@@ -187,6 +206,8 @@ class MakerOrchestrator:
                         {"reason": msg, "solution": candidate.model_dump()},
                         step_id=step_id,
                         stage="atomic",
+                        agent="verifier",
+                        model=self.runtime.config.model_solver,
                     )
                     continue
                 accepted.append(candidate)
@@ -200,6 +221,8 @@ class MakerOrchestrator:
                 {"votes": outcome.votes, "accepted": len(accepted)},
                 step_id=step_id,
                 stage="atomic",
+                agent="discriminator",
+                model=self.runtime.config.model_discriminator,
             )
             if outcome.winner and outcome.confident:
                 trace.chosen = outcome.winner.model_dump()
@@ -208,8 +231,12 @@ class MakerOrchestrator:
                     {"solution": outcome.winner.model_dump(), "confident": True},
                     step_id=step_id,
                     stage="atomic",
+                    agent="discriminator",
+                    model=self.runtime.config.model_discriminator,
                 )
                 self.step_traces.append(trace)
+                self._reporter_info("Atomic solution selected with confidence.")
+                self._report_metrics()
                 self.runtime.verifier.commit_solution(problem, outcome.winner, state)
                 return outcome.winner.solution
 
@@ -227,8 +254,12 @@ class MakerOrchestrator:
             {"solution": trace.chosen, "confident": outcome.confident},
             step_id=step_id,
             stage="atomic",
+            agent="discriminator",
+            model=self.runtime.config.model_discriminator,
         )
         self.step_traces.append(trace)
+        self._reporter_info("Atomic solution selected via fallback.")
+        self._report_metrics()
         winner = outcome.winner or accepted[0]
         self.runtime.verifier.commit_solution(problem, winner, state)
         return winner.solution
@@ -236,3 +267,16 @@ class MakerOrchestrator:
     def _next_step_id(self) -> int:
         self._step_counter += 1
         return self._step_counter
+
+    def _report_step(self, step_id: int, kind: str, problem: str, depth: int) -> None:
+        if self.runtime.reporter:
+            self.runtime.reporter.step(step_id=step_id, kind=kind, problem=problem, depth=depth)
+
+    def _report_metrics(self) -> None:
+        if self.runtime.reporter:
+            snapshot = self.runtime.metrics.snapshot(len(self.step_traces))
+            self.runtime.reporter.metrics(snapshot)
+
+    def _reporter_info(self, message: str) -> None:
+        if self.runtime.reporter:
+            self.runtime.reporter.info(message)
