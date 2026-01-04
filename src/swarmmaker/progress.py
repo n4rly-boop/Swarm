@@ -20,7 +20,7 @@ class RunReporter:
             "Models: "
             f"decomposer={config.model_decomposer}, "
             f"solver={config.model_solver}, "
-            f"discriminator={config.model_discriminator}"
+            "discriminator=ahead-by-k"
         )
         self.emit(
             f"Batch size={config.batch_size}, ahead_by={config.ahead_by}, "

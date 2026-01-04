@@ -27,9 +27,8 @@ from .verify import StateVerifier
 
 app = typer.Typer(add_completion=False, help="SwarmMaker MAKER orchestrator CLI.")
 
-DEFAULT_DECOMPOSER_MODEL = "google/gemini-2.5-flash-preview-09-2025"
+DEFAULT_DECOMPOSER_MODEL = "openai/gpt-4.1-mini"
 DEFAULT_SOLVER_MODEL = "qwen/qwen-2.5-7b-instruct"
-DEFAULT_DISCRIMINATOR_MODEL = "google/gemini-2.5-flash-preview-09-2025"
 
 
 @app.command()
@@ -37,7 +36,6 @@ def main(
     task: str = typer.Argument(..., help="Task description to solve."),
     model_decomposer: str = typer.Option(DEFAULT_DECOMPOSER_MODEL, "--model-decomposer", show_default=True),
     model_solver: str = typer.Option(DEFAULT_SOLVER_MODEL, "--model-solver", show_default=True),
-    model_discriminator: str = typer.Option(DEFAULT_DISCRIMINATOR_MODEL, "--model-discriminator", show_default=True),
     batch_size: int = typer.Option(4, "--batch-size", help="Samples per round for decomposition and solving."),
     ahead_by: int = typer.Option(2, "--ahead-by", help="Votes required beyond runner-up."),
     max_rounds: int = typer.Option(5, "--max-rounds", help="Max sampling rounds per stage."),
@@ -46,7 +44,6 @@ def main(
     timeout_seconds: int = typer.Option(60, "--timeout-seconds"),
     temperature_decomposer: float = typer.Option(0.3, "--temperature-decomposer"),
     temperature_solver: float = typer.Option(0.8, "--temperature-solver"),
-    temperature_discriminator: float = typer.Option(0.2, "--temperature-discriminator"),
     structured_mode: StructuredMode = typer.Option(
         StructuredMode.json_schema,
         "--structured-mode",
@@ -70,7 +67,6 @@ def main(
     config = SwarmConfig(
         model_decomposer=model_decomposer,
         model_solver=model_solver,
-        model_discriminator=model_discriminator,
         batch_size=batch_size,
         ahead_by=ahead_by,
         max_rounds=max_rounds,
@@ -79,7 +75,6 @@ def main(
         timeout_seconds=timeout_seconds,
         temperature_decomposer=temperature_decomposer,
         temperature_solver=temperature_solver,
-        temperature_discriminator=temperature_discriminator,
         dry_run=dry_run,
         log_dir=target_log_dir,
         structured_mode=structured_mode,

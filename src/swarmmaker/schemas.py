@@ -119,7 +119,6 @@ class SwarmConfig(BaseModel):
 
     model_decomposer: str
     model_solver: str
-    model_discriminator: str
     batch_size: int = 5
     ahead_by: int = 2
     max_rounds: int = 10
@@ -128,7 +127,6 @@ class SwarmConfig(BaseModel):
     timeout_seconds: int = 60
     temperature_decomposer: float = 0.3
     temperature_solver: float = 0.8
-    temperature_discriminator: float = 0.2
     dry_run: bool = False
     log_dir: Path = Field(default_factory=lambda: Path("runs"))
     structured_mode: StructuredMode = StructuredMode.json_schema

@@ -124,7 +124,7 @@ class MakerOrchestrator:
                 step_id=step_id,
                 stage="decomposition",
                 agent="discriminator",
-                model=self.runtime.config.model_discriminator,
+                model="ahead-by-k",
             )
             if outcome.winner:
                 trace.chosen = outcome.winner.model_dump()
@@ -135,7 +135,7 @@ class MakerOrchestrator:
                         step_id=step_id,
                         stage="decomposition",
                         agent="discriminator",
-                        model=self.runtime.config.model_discriminator,
+                        model="ahead-by-k",
                     )
                     self._reporter_info("Decomposition consensus reached.")
                     break
@@ -152,7 +152,7 @@ class MakerOrchestrator:
                     step_id=step_id,
                     stage="decomposition",
                     agent="discriminator",
-                    model=self.runtime.config.model_discriminator,
+                    model="ahead-by-k",
                 )
 
         self.step_traces.append(trace)
@@ -222,7 +222,7 @@ class MakerOrchestrator:
                 step_id=step_id,
                 stage="atomic",
                 agent="discriminator",
-                model=self.runtime.config.model_discriminator,
+                model="ahead-by-k",
             )
             if outcome.winner and outcome.confident:
                 trace.chosen = outcome.winner.model_dump()
@@ -232,7 +232,7 @@ class MakerOrchestrator:
                     step_id=step_id,
                     stage="atomic",
                     agent="discriminator",
-                    model=self.runtime.config.model_discriminator,
+                    model="ahead-by-k",
                 )
                 self.step_traces.append(trace)
                 self._reporter_info("Atomic solution selected with confidence.")
@@ -255,7 +255,7 @@ class MakerOrchestrator:
             step_id=step_id,
             stage="atomic",
             agent="discriminator",
-            model=self.runtime.config.model_discriminator,
+            model="ahead-by-k",
         )
         self.step_traces.append(trace)
         self._reporter_info("Atomic solution selected via fallback.")

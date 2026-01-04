@@ -28,7 +28,7 @@ python -m swarmmaker "draft a launch plan" --dry-run
 
 The CLI exposes MAKER controls directly:
 
-- `--model-decomposer`, `--model-solver`, `--model-discriminator` select the LLMs for decomposition, atomic solving, and tiebreaking.
+- `--model-decomposer`, `--model-solver` select the LLMs for decomposition and atomic solving (the discriminator is a deterministic ahead-by-K voter).
 - `--batch-size`, `--max-rounds`, and `--ahead-by` control sampling, filtering, and voting.
 - `--max-depth` bounds recursion, while `--max-total-tokens` + `--timeout-seconds` bound budget.
 - `--structured-mode` chooses between provider-side JSON schema or json_object formats.
@@ -42,4 +42,4 @@ Each run writes:
 - `result.json` – structured `RunResult` (task, stats, per-step traces, artifact locations).
 - `result.md` – concise Markdown summary of the task, final answer, stats, and paths.
 
-The orchestrator itself is deterministic and non-LLM: only the decomposer/solver/discriminator agents use LLM calls, while red-flag filtering and verification stay code-only.
+The orchestrator itself is deterministic and non-LLM: only the decomposer and solver agents call out to LLMs, while red-flag filtering, verification, and voting stay code-only.
