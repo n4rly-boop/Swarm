@@ -1,0 +1,2 @@
+[console_scripts]
+swarmmaker = swarmmaker.cli:app
