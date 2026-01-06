@@ -153,11 +153,30 @@ class LLMClient:
                     list(messages),
                     config={"tags": tags, "metadata": metadata},
                 )
+                
+                # Check for API errors in response metadata
+                if response.response_metadata.get("error"):
+                    error_info = response.response_metadata["error"]
+                    error_msg = error_info.get("message", "Unknown API error")
+                    if isinstance(error_info.get("metadata"), dict):
+                        provider_error = error_info["metadata"].get("raw", "")
+                        if provider_error:
+                            error_msg = f"{error_msg}: {provider_error[:200]}"
+                    raise RuntimeError(f"API error: {error_msg}")
+                
                 usage = response.response_metadata.get("token_usage", {})
                 self.metrics.record_usage(usage)
                 
                 text = response.content if isinstance(response.content, str) else json.dumps(response.content, ensure_ascii=False)
                 
+            except (TypeError, AttributeError) as err:
+                # Handle cases where API returns error response with None choices
+                if "'NoneType' object is not iterable" in str(err) or "choices" in str(err).lower():
+                    err_msg = f"API returned invalid response (likely unsupported response_format). "
+                    if self.structured_mode == StructuredMode.json_schema:
+                        err_msg += "Try --structured-mode json_object or use a different model."
+                    raise RuntimeError(err_msg) from err
+                raise
             except Exception as err:  # pragma: no cover - network
                 last_error = err
                 if attempt == attempts - 1 or not self._should_retry(err):

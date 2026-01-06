@@ -1,10 +1,11 @@
 """Deterministic orchestrator implementing the MAKER loop."""
-from __future__ import annotations
+
 
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from .completeness import CompletenessChecker
 from .composer import FinalComposer
 from .decomposer import Decomposer
 from .discriminator import DecompositionDiscriminator, SolutionDiscriminator
@@ -14,6 +15,7 @@ from .progress import ProgressTracker, RunReporter
 from .red_flag import RedFlagGuard
 from .schemas import (
     AtomicSolution,
+    CompletenessResult,
     DecompositionProposal,
     FinalAnswer,
     RunArtifacts,
@@ -37,6 +39,7 @@ class MakerRuntime:
     red_flag: RedFlagGuard
     verifier: StateVerifier
     global_verifier: GlobalVerifier
+    completeness_checker: CompletenessChecker
     composer: FinalComposer
     logger: EventLogger
     metrics: MetricsTracker
@@ -158,11 +161,16 @@ class MakerOrchestrator:
         self._record_progress("compose")
         return combined
 
-    def _finalize(self, stage: str, feedback: Optional[str] = None) -> Optional[FinalAnswer]:
+    def _finalize(self, stage: str, feedback: Optional[str] = None, _gap_depth: int = 0) -> Optional[FinalAnswer]:
         if not self.task_state:
             return None
+        if _gap_depth > 2:
+            self._reporter_info("Max gap-fill depth reached.")
+            return None
+
         reason = feedback
         payload: Optional[FinalAnswer] = None
+
         for attempt in range(2):
             step_id = self._next_step_id()
             candidate = self.runtime.composer.compose(
@@ -171,31 +179,76 @@ class MakerOrchestrator:
                 step_id=step_id,
                 feedback=reason if attempt else feedback,
             )
-            ok, verify_reason = self.runtime.global_verifier.verify(self.task_state.task, candidate, self.task_state)
-            event_type = "global_verify_pass" if ok else "global_verify_fail"
+
+            # Check completeness with LLM
+            completeness = self.runtime.completeness_checker.check(
+                task=self.task_state.task,
+                answer=candidate.answer,
+                state=self.task_state,
+                step_id=step_id,
+            )
+
             self.runtime.logger.log(
-                event_type,
+                "completeness_check",
                 {
                     "stage": stage,
                     "attempt": attempt,
-                    "reason": verify_reason,
+                    "complete": completeness.complete,
+                    "requirements": [r.model_dump() for r in completeness.requirements],
+                    "missing_work": completeness.missing_work,
                     "candidate": candidate.model_dump(),
                 },
-                agent="verifier",
+                agent="completeness",
                 stage="finalize",
                 step_id=step_id,
-                model=self.runtime.config.model_composer or self.runtime.config.model_solver,
+                model=self.runtime.config.model_solver,
             )
-            if ok:
-                payload = candidate
-                break
-            reason = verify_reason
-            self.task_state.notes.append(f"composer retry: {verify_reason}")
+
+            if completeness.complete:
+                # Also run basic sanity checks (sympy validation if points present)
+                ok, verify_reason = self.runtime.global_verifier.verify(
+                    self.task_state.task, candidate, self.task_state
+                )
+                if ok:
+                    self._reporter_info("Answer complete and verified.")
+                    payload = candidate
+                    break
+                else:
+                    reason = verify_reason
+                    self.task_state.notes.append(f"verification failed: {verify_reason}")
+                    self.runtime.metrics.increment_retry()
+                    continue
+
+            # Not complete - fill gaps with additional atomic solves
+            if completeness.missing_work:
+                self._reporter_info(f"Filling {len(completeness.missing_work)} missing requirement(s).")
+                for missing in completeness.missing_work:
+                    try:
+                        gap_solution = self._solve_atomic(
+                            missing,
+                            depth=self.task_state.depth,
+                            forced=True,
+                            mode="gap_fill",
+                        )
+                        self.task_state.notes.append(f"gap filled: {missing[:50]}... -> {gap_solution[:50]}...")
+                        self._reporter_info(f"Gap filled: {missing[:40]}...")
+                    except RuntimeError as e:
+                        self.task_state.notes.append(f"gap fill failed: {missing[:50]}... ({e})")
+
+                # Recompose with filled gaps
+                return self._finalize(stage="gap_filled", _gap_depth=_gap_depth + 1)
+
+            # No missing work but incomplete - use reason as feedback
+            reason = "; ".join(
+                r.reason for r in completeness.requirements if r.status == "MISSING"
+            )
+            self.task_state.notes.append(f"incomplete: {reason}")
             self.runtime.metrics.increment_retry()
+
         if payload:
             self.final_payload = payload
         else:
-            self._reporter_info("Final answer could not be verified.")
+            self._reporter_info("Final answer could not be completed.")
         return payload
 
     def _run_decomposition(self, problem: str, depth: int) -> Tuple[Optional[DecompositionProposal], StepTrace]:
@@ -207,7 +260,7 @@ class MakerOrchestrator:
             {"problem": problem, "depth": depth},
             step_id=step_id,
             stage="decomposition",
-            agent="orchestrator",
+            agent="decomposer",
             model=self.runtime.config.model_decomposer,
         )
         proposals: List[DecompositionProposal] = []
@@ -369,7 +422,7 @@ class MakerOrchestrator:
             {"problem": problem, "depth": depth, "forced": forced, "mode": mode},
             step_id=step_id,
             stage="atomic",
-            agent="orchestrator",
+            agent="solver",
             model=self.runtime.config.model_solver,
         )
         accepted: List[AtomicSolution] = []

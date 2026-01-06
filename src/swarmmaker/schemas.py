@@ -110,6 +110,29 @@ class FinalAnswer(BaseModel):
     support: Optional[FinalSupport] = None
 
 
+class RequirementStatus(BaseModel):
+    """Status of a single requirement from the task."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    requirement: str = Field(description="The requirement extracted from the task.")
+    status: Literal["ADDRESSED", "MISSING"] = Field(description="Whether this requirement is addressed.")
+    reason: str = Field(description="Why the requirement is addressed or missing.")
+
+
+class CompletenessResult(BaseModel):
+    """Result of checking if all task requirements are addressed."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    requirements: List[RequirementStatus] = Field(default_factory=list)
+    complete: bool = Field(description="True if all requirements are addressed.")
+    missing_work: List[str] = Field(
+        default_factory=list,
+        description="Specific tasks to perform to fill gaps, if any.",
+    )
+
+
 class TaskState(BaseModel):
     """Minimal state snapshot shared with the orchestrator."""
 

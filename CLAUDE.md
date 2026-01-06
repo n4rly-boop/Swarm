@@ -54,30 +54,37 @@ export LANGCHAIN_PROJECT="maker"
 MAKER implements the architecture defined in `MAKER.md`:
 
 ```
-┌──────────────┐
-│  Orchestrator│  (Non-LLM, deterministic)
-└──────┬───────┘
-       │
-       ▼
-┌─────────────────────────┐
-│   Problem Decomposition │◄──────────────┐
-└──────────┬──────────────┘               │
-           ▼                              │
-┌─────────────────────────┐              │
-│   Atomic Step Execution │              │
-└──────────┬──────────────┘              │
-           ▼                              │
-┌─────────────────────────┐              │
-│  Red-Flag Filtering     │              │
-└──────────┬──────────────┘              │
-           ▼                              │
-┌─────────────────────────┐              │
-│  Voting (Ahead-by-K)    │──────────────┘
-└──────────┬──────────────┘
-           ▼
-┌─────────────────────────┐
-│ State Update + Verify   │  (Non-LLM, deterministic)
-└─────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                    Orchestrator (Non-LLM)                    │
+│  - Owns global TaskState                                     │
+│  - Dispatches agents, controls flow                          │
+│  - Tracks progress, detects stagnation                       │
+└──────────────────────────┬───────────────────────────────────┘
+                           │
+         ┌─────────────────┼─────────────────┐
+         ▼                 ▼                 ▼
+┌─────────────────┐ ┌─────────────┐ ┌────────────────┐
+│  Direct Solve   │ │ Decomposer  │ │ FinalComposer  │
+│  (fast path)    │ │   (LLM)     │ │    (LLM)       │
+└────────┬────────┘ └──────┬──────┘ └───────┬────────┘
+         │                 │                 │
+         ▼                 ▼                 ▼
+┌─────────────────────────────────────────────────────────────┐
+│               Atomic Solver (LLM, batch sampling)           │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+         ┌─────────────────┼─────────────────┐
+         ▼                 ▼                 ▼
+┌─────────────────┐ ┌─────────────┐ ┌────────────────┐
+│  Red-Flag Guard │ │ StateVerify │ │ Discriminator  │
+│    (Code)       │ │   (Code)    │ │ (Ahead-by-K)   │
+└─────────────────┘ └─────────────┘ └────────────────┘
+                           │
+                           ▼
+              ┌────────────────────────┐
+              │   GlobalVerifier       │
+              │ (Code + sympy math)    │
+              └────────────────────────┘
 ```
 
 ---
@@ -160,14 +167,66 @@ Hard rejection triggers:
 
 **Rejected outputs are discarded silently** - no repair, no feedback to the model.
 
-### 7. Verifier (`verifier.py`)
+### 7. Verifier (`verify.py`)
+**Code only, NEVER LLM**
+
+Two classes:
+- **StateVerifier**: Step-level validation
+  - Validate solution correctness (non-empty, work shown)
+  - Detect duplicate solutions via signature tracking
+  - Score decompositions and solutions for selection
+  - Validate decomposition quality (no tautologies)
+
+- **GlobalVerifier**: Basic sanity checks + sympy validation
+  - Verify answer not empty
+  - Symbolic math validation using sympy (if points provided)
+
+### 8. Completeness Checker (`completeness.py`)
+**LLM-based**
+
+Role: Verify that the answer addresses ALL task requirements
+
+Input: Task + Answer + State
+Output:
+```json
+{
+  "requirements": [
+    {"requirement": "find intersection points", "status": "ADDRESSED", "reason": "..."},
+    {"requirement": "show sum of vectors", "status": "MISSING", "reason": "..."}
+  ],
+  "complete": false,
+  "missing_work": ["Calculate the vector sum of the intersection points"]
+}
+```
+
+If incomplete, the orchestrator spawns atomic solvers for each `missing_work` item, then recomposes.
+
+### 10. Final Composer (`composer.py`)
+**LLM-based**
+
+Role: Compose solved subproblems into a coherent final answer
+
+Input: Task + TaskState with solved subproblems
+Output:
+```json
+{
+  "answer": "direct response to task",
+  "confidence": 0.95,
+  "support": {
+    "summary": "...",
+    "equations": ["y = 2x + 1", ...],
+    "points": [{"label": "P1", "values": {"x": 1, "y": 3}}]
+  }
+}
+```
+
+### 11. Progress Tracker (`progress.py`)
 **Code only, NEVER LLM**
 
 Responsibilities:
-- Validate step correctness against known invariants
-- Check state transitions are legal
-- Enforce domain constraints (balanced equations, valid syntax, etc.)
-- Reject and trigger retry if validation fails
+- Track state changes via content hashing
+- Detect stagnation (no progress after N rounds)
+- Trigger escalation when stuck (force finalization)
 
 ---
 
@@ -180,6 +239,35 @@ For each atomic step:
 3. **Vote**: Count equivalent outputs, continue until `winner_count >= max(other_counts) + K`
 4. **Commit**: Apply the winning solution
 5. **Verify**: Reject and retry if state validation fails
+
+---
+
+## Orchestration Phases
+
+### Direct Solve Phase
+Before decomposition, the orchestrator attempts a low-cost direct solve:
+- Uses smaller batch size and fewer rounds
+- Lower temperature for consistency
+- If verified successfully, skips decomposition entirely
+- Efficient for simple tasks that don't need breaking down
+
+### Decomposition Phase
+If direct solve fails or cannot be verified:
+- Recursive decomposition until atomic problems
+- Each subproblem solved independently
+- Results composed via `compose_fn`
+
+### Finalization Phase
+After solving (direct or decomposed):
+- FinalComposer creates coherent answer from state
+- GlobalVerifier validates against original task
+- Retry with feedback if verification fails (max 2 attempts)
+
+### Stagnation Detection
+ProgressTracker monitors for stuck states:
+- Hashes state content after each step
+- If hash unchanged for `max_stagnant_rounds`, triggers escalation
+- Escalation: attempts one more atomic solve with adjusted temperature, then forces finalization
 
 ---
 
@@ -228,22 +316,22 @@ src/swarmmaker/
 ├── config.py             # Environment/settings
 │
 ├── orchestrator.py       # Non-LLM coordinator (state machine)
-├── state.py              # Global task state (immutable snapshots)
+├── schemas.py            # Pydantic models (contracts) + TaskState
 │
-├── decomposer.py         # Decomposition agents + discriminators
+├── decomposer.py         # Decomposition agents
 ├── solver.py             # Atomic solver agents
-├── discriminator.py      # Solution equivalence + voting
+├── discriminator.py      # Solution equivalence discriminators
+├── composer.py           # Final answer composer (LLM-based)
+├── completeness.py       # Completeness checker (LLM-based)
 │
 ├── red_flag.py           # Red-flag filtering (pre-vote rejection)
-├── verifier.py           # Code-only state validation
+├── verify.py             # Code-only sanity checks + sympy validation
 ├── voting.py             # Ahead-by-K consensus engine
+├── progress.py           # Progress tracking + stagnation detection
 │
 ├── llm.py                # OpenRouter LLM client
-├── schemas.py            # Pydantic models (contracts)
-│
-├── callbacks.py          # Rich terminal UI
 ├── io.py                 # Event logging (JSONL) + results
-└── langsmith.py          # Tracing integration
+└── (optional tracing via LangSmith)
 ```
 
 ---
@@ -268,14 +356,35 @@ class AtomicSolution(BaseModel):
     work_shown: str           # Intermediate steps (for auditability)
 ```
 
+### FinalAnswer
+```python
+class FinalAnswer(BaseModel):
+    answer: str               # Direct response to the original task
+    confidence: float         # 0.0 to 1.0
+    support: Optional[FinalSupport]  # Structured evidence (equations, points)
+```
+
+### CompletenessResult
+```python
+class CompletenessResult(BaseModel):
+    requirements: List[RequirementStatus]  # Status of each task requirement
+    complete: bool            # True if all requirements addressed
+    missing_work: List[str]   # Specific tasks to fill gaps
+```
+
 ### TaskState
 ```python
 class TaskState(BaseModel):
     task: str                 # Original problem
     decomposition_tree: dict  # Recursive structure
     solved_subproblems: dict  # problem_id -> solution
+    facts: dict               # step_id -> ProblemFact (capped to max_facts)
     current_problem: str      # Active subproblem
     depth: int                # Recursion depth
+    notes: list               # Progress notes and warnings
+    draft_answer: str         # Best current answer candidate
+    progress_version: int     # Incremented on state changes
+    progress_hash: str        # Content hash for stagnation detection
 ```
 
 ---

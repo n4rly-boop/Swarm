@@ -6,6 +6,7 @@ from typing import Optional
 
 import typer
 
+from .completeness import CompletenessChecker
 from .composer import FinalComposer
 from .config import settings
 from .decomposer import Decomposer
@@ -118,6 +119,7 @@ def main(
         red_flag=RedFlagGuard(),
         verifier=verifier,
         global_verifier=GlobalVerifier(),
+        completeness_checker=CompletenessChecker(llm_client, config),
         composer=FinalComposer(llm_client, config),
         logger=events,
         metrics=metrics,

@@ -1,5 +1,5 @@
 """Final composer that integrates solved subproblems into a single answer."""
-from __future__ import annotations
+
 
 from typing import Any, Dict, List, Optional
 
