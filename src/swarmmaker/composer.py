@@ -46,7 +46,7 @@ class FinalComposer:
         result = self.llm.structured_completion(
             prompts,
             meta=meta,
-            model=self.config.model_composer or self.config.model_solver,
+            model=self.config.model_decomposer,
             temperature=self.config.temperature_composer,
             schema_name="FinalAnswer",
             schema=self.schema,

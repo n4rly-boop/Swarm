@@ -86,8 +86,9 @@ class SupportPoint(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     label: str
-    values: Dict[str, float] = Field(default_factory=dict)
-    statement: Optional[str] = None
+    x: float = Field(default=0.0, description="X coordinate value.")
+    y: float = Field(default=0.0, description="Y coordinate value.")
+    statement: str = Field(default="", description="Description of this point.")
 
 
 class FinalSupport(BaseModel):
@@ -95,7 +96,7 @@ class FinalSupport(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    summary: Optional[str] = None
+    summary: str = Field(default="", description="Brief summary of the support evidence.")
     equations: List[str] = Field(default_factory=list)
     points: List[SupportPoint] = Field(default_factory=list)
 
@@ -107,7 +108,7 @@ class FinalAnswer(BaseModel):
 
     answer: str = Field(min_length=1, description="Direct response to the original task.")
     confidence: float = Field(ge=0.0, le=1.0)
-    support: Optional[FinalSupport] = None
+    support: FinalSupport = Field(default_factory=FinalSupport, description="Supporting evidence.")
 
 
 class RequirementStatus(BaseModel):
@@ -194,7 +195,6 @@ class SwarmConfig(BaseModel):
 
     model_decomposer: str
     model_solver: str
-    model_composer: Optional[str] = None
     batch_size: int = 5
     ahead_by: int = 2
     max_rounds: int = 10

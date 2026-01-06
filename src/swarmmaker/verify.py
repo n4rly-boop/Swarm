@@ -178,10 +178,10 @@ class GlobalVerifier:
             return True, "could not parse equations"
 
         for point in points[:4]:
-            px = point.values.get("x")
-            py = point.values.get("y")
-            if px is None and py is None:
-                continue
+            px = point.x
+            py = point.y
+            if px == 0.0 and py == 0.0:
+                continue  # Skip default/unset points
             for expr in parsed:
                 try:
                     result = expr.subs({"x": px, "y": py})
@@ -191,7 +191,7 @@ class GlobalVerifier:
                 if not math.isfinite(numeric):
                     return False, "non-finite verification value"
                 if abs(numeric) > 1e-5:
-                    return False, f"point {point.values} does not satisfy equation"
+                    return False, f"point ({px}, {py}) does not satisfy equation"
         return True, "equations satisfied"
 
     def _extract_equations(self, task: str) -> List[str]:

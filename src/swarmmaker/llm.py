@@ -1,4 +1,5 @@
 """LLM client wrapper that enforces structured outputs."""
+import copy
 import json
 import random
 import time
@@ -11,6 +12,38 @@ from pydantic import ValidationError
 from .schemas import AgentCallMeta, SchemaValidationError, StructuredMode, StructuredParseResult
 
 T = TypeVar("T")
+
+
+def _make_strict_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Make schema OpenAI-strict compatible.
+
+    - Adds all properties to required array
+    - Removes extra keywords from $ref objects (OpenAI doesn't allow them)
+    """
+    schema = copy.deepcopy(schema)
+
+    def fix_object(obj: Dict[str, Any]) -> None:
+        # $ref must be alone - remove other keywords
+        if "$ref" in obj:
+            keys_to_remove = [k for k in obj.keys() if k != "$ref"]
+            for k in keys_to_remove:
+                del obj[k]
+            return
+
+        if obj.get("type") == "object" and "properties" in obj:
+            obj["required"] = list(obj["properties"].keys())
+            obj["additionalProperties"] = False
+            for prop in obj["properties"].values():
+                fix_object(prop)
+        elif obj.get("type") == "array" and "items" in obj:
+            fix_object(obj["items"])
+
+    # Fix top-level and all $defs
+    fix_object(schema)
+    for defn in schema.get("$defs", {}).values():
+        fix_object(defn)
+
+    return schema
 
 
 class MetricsTracker:
@@ -216,11 +249,12 @@ class LLMClient:
         if self.structured_mode == StructuredMode.json_object:
             return {"type": "json_object"}
         sanitized = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in schema_name)[:64] or "SwarmSchema"
+        strict_schema = _make_strict_schema(schema)
         return {
             "type": "json_schema",
             "json_schema": {
                 "name": sanitized,
-                "schema": schema,
+                "schema": strict_schema,
                 "strict": True,
             },
         }

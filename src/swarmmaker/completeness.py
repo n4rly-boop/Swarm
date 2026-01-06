@@ -1,6 +1,4 @@
 """Completeness checker agent for verifying task requirements are addressed."""
-from __future__ import annotations
-
 from typing import TYPE_CHECKING
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -52,11 +50,19 @@ class CompletenessChecker:
                     "You are a completeness verifier for a task-solving system.\n"
                     "Given a task and an answer, determine if ALL requirements are fully addressed.\n\n"
                     "Rules:\n"
-                    "- Extract each distinct requirement from the task\n"
+                    "- Extract ONLY requirements EXPLICITLY stated in the task text\n"
+                    "- Do NOT invent requirements like 'show work' or 'provide steps' unless explicitly asked\n"
                     "- For each requirement, determine if it is ADDRESSED or MISSING\n"
-                    "- Be strict: vague or partial answers count as MISSING\n"
-                    "- If something is MISSING, provide a specific actionable task in missing_work\n"
-                    "- The missing_work items should be concrete problems that can be solved\n"
+                    "- Be strict: vague or partial answers count as MISSING\n\n"
+                    "For missing_work items (CRITICAL):\n"
+                    "- Workers have ZERO context - they cannot see the task or answer\n"
+                    "- Each missing_work MUST be a self-contained calculation with ALL values inline\n"
+                    "- Use actual numbers from the answer, formatted as a direct computation\n"
+                    "Examples:\n"
+                    "  BAD: 'Calculate the sum of vectors to the points'\n"
+                    "  BAD: 'Calculate vector from origin to (3,4)'\n"
+                    "  GOOD: 'What is (3,4) + (1,-2)?'\n"
+                    "  GOOD: 'Compute 3 + 1 and 4 + (-2)'\n"
                     "- Respond with JSON only, no prose"
                 )
             ),
@@ -65,7 +71,7 @@ class CompletenessChecker:
                     f"Task: {task}\n\n"
                     f"Answer: {answer}"
                     f"{context}\n\n"
-                    "Analyze completeness and return CompletenessResult JSON."
+                    "Extract ONLY explicit requirements. Write missing_work as direct computations with all values."
                 )
             ),
         ]
@@ -73,7 +79,7 @@ class CompletenessChecker:
         result = self.llm.structured_completion(
             messages,
             meta=meta,
-            model=self.config.model_solver,
+            model=self.config.model_decomposer,
             temperature=0.1,  # Low temperature for consistent verification
             schema_name="CompletenessResult",
             schema=self.schema,
