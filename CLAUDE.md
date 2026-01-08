@@ -30,13 +30,19 @@ python -m swarmmaker "your task here"
 # Dry run (no API calls)
 python -m swarmmaker "task" --dry-run
 
-# Custom configuration
+# Custom configuration with role-based models
 python -m swarmmaker "task" \
-  --model-decomposer anthropic/claude-3-haiku \
-  --model-solver qwen/qwen2.5-coder-7b-instruct \
+  --model-reasoning anthropic/claude-sonnet-4 \
+  --model-execution qwen/qwen2.5-coder-7b-instruct \
   --batch-size 5 \
   --ahead-by 2 \
   --max-rounds 10
+
+# With calibration phase (estimates optimal K)
+python -m swarmmaker "task" --calibrate
+
+# Math domain (sympy verification)
+python -m swarmmaker "solve x^2 = 4" --domain math
 ```
 
 ### Environment Variables
@@ -47,58 +53,115 @@ export LANGSMITH_API_KEY=...                              # optional tracing
 export LANGCHAIN_PROJECT="maker"
 ```
 
+### CLI Options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--model-reasoning, -r` | Decomposition, composition, completeness | `claude-sonnet-4` |
+| `--model-execution, -e` | Atomic solving | `claude-sonnet-4` |
+| `--batch-size` | Samples per round | 4 |
+| `--ahead-by` | Votes required beyond runner-up | 2 |
+| `--max-rounds` | Max sampling rounds | 5 |
+| `--max-depth` | Maximum recursion depth | 6 |
+| `--max-total-tokens` | Token budget | 50,000 |
+| `--timeout-seconds` | Per-call timeout | 60s |
+| `--timeout-total` | Total orchestrator timeout | 600s |
+| `--calibrate` | Enable pre-run calibration phase | False |
+| `--domain` | Adapter: "default", "math" | "default" |
+| `--structured-mode` | json_schema or json_object | json_schema |
+| `--dry-run` | Mock results without API calls | False |
+| `--log-dir` | Output directory | `runs/<timestamp>` |
+
 ---
 
 ## Architecture
 
-MAKER implements the architecture defined in `MAKER.md`:
+MAKER implements a three-phase orchestration flow:
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                    Orchestrator (Non-LLM)                    │
-│  - Owns global TaskState                                     │
-│  - Dispatches agents, controls flow                          │
-│  - Tracks progress, detects stagnation                       │
-└──────────────────────────┬───────────────────────────────────┘
-                           │
-         ┌─────────────────┼─────────────────┐
-         ▼                 ▼                 ▼
-┌─────────────────┐ ┌─────────────┐ ┌────────────────┐
-│  Direct Solve   │ │ Decomposer  │ │ FinalComposer  │
-│  (fast path)    │ │   (LLM)     │ │    (LLM)       │
-└────────┬────────┘ └──────┬──────┘ └───────┬────────┘
-         │                 │                 │
-         ▼                 ▼                 ▼
 ┌─────────────────────────────────────────────────────────────┐
-│               Atomic Solver (LLM, batch sampling)           │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-         ┌─────────────────┼─────────────────┐
-         ▼                 ▼                 ▼
-┌─────────────────┐ ┌─────────────┐ ┌────────────────┐
-│  Red-Flag Guard │ │ StateVerify │ │ Discriminator  │
-│    (Code)       │ │   (Code)    │ │ (Ahead-by-K)   │
-└─────────────────┘ └─────────────┘ └────────────────┘
-                           │
-                           ▼
-              ┌────────────────────────┐
-              │   GlobalVerifier       │
-              │ (Code + sympy math)    │
-              └────────────────────────┘
+│                   CLI (cli.py)                              │
+│         - Role-based model selection                        │
+│         - Calibration flag                                  │
+│         - Domain adapter selection                          │
+└─────────────┬───────────────────────────────────────────────┘
+              │
+┌─────────────▼───────────────────────────────────────────────┐
+│            Calibrator (calibration.py)                      │
+│  [Optional] Estimate p, calculate optimal K                 │
+└─────────────┬───────────────────────────────────────────────┘
+              │
+┌─────────────▼───────────────────────────────────────────────┐
+│         MakerOrchestrator (orchestrator.py)                 │
+│              (Non-LLM, Deterministic)                       │
+├─────────────────────────────────────────────────────────────┤
+│ Phase 1: Direct Solve (low-cost attempt)                    │
+│ Phase 2: Recursive Decomposition                            │
+│ Phase 3: Finalization (compose → check → verify → gap-fill) │
+│ • Progress Tracking (stagnation detection)                  │
+│ • Cycle Detection (memoization)                             │
+│ • Timeout Handling                                          │
+└─────┬──────────┬──────────────┬──────────┬──────────────────┘
+      │          │              │          │
+      ▼          ▼              ▼          ▼
+  Decomposer  Solver      Composer      Completeness
+   (LLM)      (LLM)        (LLM)         Checker (LLM)
+      │          │              │          │
+      │    ┌─────┴──────────┬───┴────┐     │
+      │    │                │        │     │
+      ▼    ▼                ▼        ▼     ▼
+    DecompositionDiscriminator    SolutionDiscriminator
+         (ahead-by-K)                 (ahead-by-K)
+              │                            │
+              └────┬─────────────┬─────────┘
+                   │             │
+                   ▼             ▼
+              RedFlagGuard    StateVerifier
+               (pre-vote)      (post-vote)
+                   │             │
+                   └─────┬───────┘
+                         │
+                         ▼
+                  GlobalVerifier
+               (final sanity checks)
+                         │
+         ┌───────────────┴───────────────┐
+         │                               │
+         ▼                               ▼
+    DomainAdapter                 EventLogger
+     (pluggable)                    (JSONL)
 ```
 
 ---
 
 ## Agent Types
 
+### 0. Calibrator (`calibration.py`)
+**Code + LLM sampling, optional pre-run phase**
+
+Purpose: Estimate per-step success probability (p) and calculate optimal ahead-by-K value.
+
+Configuration (`CalibrationConfig`):
+- `enabled`: Whether to run calibration phase
+- `samples`: Number of calibration samples (default: 5)
+- `target_error_rate`: Target error rate (default: 0.01)
+- `fallback_p`: Assumed success probability if skipped (default: 0.7)
+- `max_k`: Maximum ahead-by-k value (default: 5)
+
+Key Methods:
+- `calculate_optimal_k(p, target_error_rate)`: Uses formula `error_rate ≈ ((1-p)/p)^k`
+- `estimate_p_from_samples()`: Bayesian estimation with prior
+- `get_default_result()`: Returns fallback when calibration skipped
+
 ### 1. Orchestrator (`orchestrator.py`)
 **Non-LLM, deterministic, auditable**
 
 Responsibilities:
 - Owns global task state
-- Dispatches agents in correct sequence
+- Dispatches agents in three phases (Direct → Decompose → Finalize)
 - Controls retries, limits, escalation
 - Persists full execution trace
+- Detects cycles and stagnation
 - Routes problems to decomposition or atomic solving
 
 The Orchestrator is the ONLY component that mutates global state. It never uses an LLM.
@@ -140,16 +203,16 @@ Constraints:
 - No awareness of broader task
 
 ### 5. Solution Discriminators (`discriminator.py`)
-**LLM or Code**
+**Deterministic (ahead-by-K voting)**
 
 Role:
 - Cluster equivalent solutions (semantic equivalence)
-- Vote to determine dominant answer
+- Vote to determine dominant answer using ahead-by-K
 
-May be replaced by:
-- Exact match
-- Semantic equivalence classifier
-- Domain-specific verifier (math, code)
+Implementation:
+- Uses solution signatures for equivalence (canonical hash)
+- Deterministic voting—no LLM involved
+- Counts votes per cluster, winner needs K ahead of runner-up
 
 ### 6. Red-Flag Guard (`red_flag.py`)
 **Code + Optional LLM**
@@ -220,13 +283,43 @@ Output:
 }
 ```
 
-### 11. Progress Tracker (`progress.py`)
+### 11. Progress Tracker (integrated in `orchestrator.py`)
 **Code only, NEVER LLM**
 
 Responsibilities:
 - Track state changes via content hashing
 - Detect stagnation (no progress after N rounds)
 - Trigger escalation when stuck (force finalization)
+
+Implementation: `ProgressTracker` dataclass in orchestrator.py with:
+- `record(state)`: Hashes semantic content (facts, solutions, draft)
+- `stagnant()`: Returns true after `max_stagnant_rounds` without change
+
+### 12. Domain Adapters (`adapters/`)
+**Pluggable verification and composition system**
+
+Purpose: Domain-specific verification, evidence extraction, and result composition.
+
+Base Class (`adapters/base.py`):
+```python
+class BaseDomainAdapter(ABC):
+    name: str
+    def verify_solution(self, solution: str, context: Dict) -> Tuple[bool, str]
+    def extract_evidence(self, text: str) -> Dict[str, Any]
+    def compose_results(self, results: List[str], compose_fn: str) -> str
+    def get_red_flag_patterns(self) -> List[RedFlagPattern]
+    def get_calibration_problems(self) -> List[str]
+```
+
+Built-in Adapters:
+- **DefaultAdapter** (`adapters/default.py`): Basic text verification, concatenation-based composition
+- **MathAdapter** (`adapters/math.py`): Math-specific with sympy integration, equation/point extraction
+
+Usage:
+```bash
+python -m swarmmaker "task" --domain math
+python -m swarmmaker "task" --domain default
+```
 
 ---
 
@@ -258,10 +351,15 @@ If direct solve fails or cannot be verified:
 - Results composed via `compose_fn`
 
 ### Finalization Phase
-After solving (direct or decomposed):
-- FinalComposer creates coherent answer from state
-- GlobalVerifier validates against original task
-- Retry with feedback if verification fails (max 2 attempts)
+After solving (direct or decomposed), a 2-attempt loop:
+1. FinalComposer creates coherent answer from state (LLM)
+2. CompletenessChecker verifies all requirements addressed (LLM)
+3. If complete → GlobalVerifier validates (code)
+4. If incomplete → Atomic solve for each `missing_work` item → Recompose
+
+Fallbacks:
+- If LLM composer fails, code-based composition from `draft_answer`
+- Emergency finalization returns draft with low confidence (0.3)
 
 ### Stagnation Detection
 ProgressTracker monitors for stuck states:
@@ -313,24 +411,30 @@ def solve(problem):
 src/swarmmaker/
 ├── __main__.py           # Entry point
 ├── cli.py                # CLI with Typer
-├── config.py             # Environment/settings
 │
-├── orchestrator.py       # Non-LLM coordinator (state machine)
-├── schemas.py            # Pydantic models (contracts) + TaskState
+├── orchestrator.py       # Non-LLM coordinator (state machine) + ProgressTracker
+├── schemas.py            # Pydantic models, configs, contracts
+├── calibration.py        # Pre-run calibration for optimal K
 │
 ├── decomposer.py         # Decomposition agents
 ├── solver.py             # Atomic solver agents
-├── discriminator.py      # Solution equivalence discriminators
+├── discriminator.py      # Solution equivalence discriminators (deterministic)
 ├── composer.py           # Final answer composer (LLM-based)
 ├── completeness.py       # Completeness checker (LLM-based)
 │
 ├── red_flag.py           # Red-flag filtering (pre-vote rejection)
 ├── verify.py             # Code-only sanity checks + sympy validation
 ├── voting.py             # Ahead-by-K consensus engine
-├── progress.py           # Progress tracking + stagnation detection
 │
-├── llm.py                # OpenRouter LLM client
+├── llm.py                # OpenRouter LLM client + metrics
 ├── io.py                 # Event logging (JSONL) + results
+│
+├── adapters/             # Domain-specific verification
+│   ├── __init__.py       # Plugin registry and factory
+│   ├── base.py           # BaseDomainAdapter abstract class
+│   ├── default.py        # Basic text verification
+│   └── math.py           # Math-specific with sympy
+│
 └── (optional tracing via LangSmith)
 ```
 
@@ -338,7 +442,47 @@ src/swarmmaker/
 
 ## Schemas
 
-### DecompositionProposal
+### Configuration Models
+
+```python
+class ModelRoles(BaseModel):
+    reasoning: str   # For decomposition, composition, completeness (default: claude-sonnet-4)
+    execution: str   # For atomic solving (default: claude-sonnet-4)
+
+class ThresholdConfig(BaseModel):
+    # Voting thresholds
+    min_samples_for_confidence: int = 3
+    temperature_first_vote: float = 0.0
+    temperature_subsequent: float = 0.1
+    # Red-flag limits
+    max_solution_tokens: int = 750
+    max_solution_chars: int = 3000
+    min_confidence: float = 0.3
+    # State management
+    max_facts: int = 5
+    max_notes: int = 20
+    max_work_shown_chars: int = 1200
+
+class CalibrationConfig(BaseModel):
+    enabled: bool = False
+    samples: int = 5
+    target_error_rate: float = 0.01
+    fallback_p: float = 0.7
+    max_k: int = 5
+
+class SwarmConfig(BaseModel):
+    models: ModelRoles
+    thresholds: ThresholdConfig
+    calibration: CalibrationConfig
+    batch_size: int = 4
+    ahead_by: int = 2
+    max_rounds: int = 5
+    max_depth: int = 6
+    # ... additional runtime parameters
+```
+
+### Domain Models
+
 ```python
 class DecompositionProposal(BaseModel):
     subproblem_a: str
@@ -346,26 +490,31 @@ class DecompositionProposal(BaseModel):
     compose_fn: str           # How to combine results
     is_atomic: bool           # True if problem cannot be further decomposed
     rationale: str            # Why this decomposition
-```
+    # Property: signature (canonical JSON hash)
 
-### AtomicSolution
-```python
 class AtomicSolution(BaseModel):
     solution: str             # The actual answer
     confidence: float         # 0.0 to 1.0
     work_shown: str           # Intermediate steps (for auditability)
-```
+    # Property: signature (canonical hash for voting)
 
-### FinalAnswer
-```python
+class ProblemFact(BaseModel):
+    problem: str
+    solution: str
+    work_shown: str
+    confidence: float
+    depth: int
+
+class FinalSupport(BaseModel):
+    summary: str
+    equations: List[str]
+    points: List[SupportPoint]
+
 class FinalAnswer(BaseModel):
     answer: str               # Direct response to the original task
     confidence: float         # 0.0 to 1.0
-    support: Optional[FinalSupport]  # Structured evidence (equations, points)
-```
+    support: Optional[FinalSupport]  # Structured evidence
 
-### CompletenessResult
-```python
 class CompletenessResult(BaseModel):
     requirements: List[RequirementStatus]  # Status of each task requirement
     complete: bool            # True if all requirements addressed
@@ -385,6 +534,38 @@ class TaskState(BaseModel):
     draft_answer: str         # Best current answer candidate
     progress_version: int     # Incremented on state changes
     progress_hash: str        # Content hash for stagnation detection
+```
+
+### Execution Trace Models
+```python
+class StepTrace(BaseModel):
+    step_id: str
+    kind: str                 # "decomposition" or "atomic"
+    problem: str
+    depth: int
+    candidates: List
+    chosen: Any
+    votes: Dict
+    notes: List[str]
+    rejections: List
+
+class RunStats(BaseModel):
+    elapsed_s: float
+    llm_calls: int
+    tokens_in: int
+    tokens_out: int
+    retries: int
+    consensus_votes: int
+    aborted_reason: Optional[str]
+
+class RunResult(BaseModel):
+    task: str
+    final_answer: str
+    final_payload: FinalAnswer
+    steps: List[StepTrace]
+    stats: RunStats
+    artifacts: Dict
+    created_at: str
 ```
 
 ---
@@ -506,9 +687,17 @@ Each run creates `./runs/<timestamp>/`:
 **Symptom**: Same problem keeps decomposing without becoming atomic
 
 **Solutions**:
-- Add max_depth limit to orchestrator
+- Reduce `--max-depth` (default: 6)
 - Improve atomicity detection in decomposer prompt
-- Force atomic solving after N decomposition attempts
+- Cycle detection automatically forces atomic solving
+
+### Stagnation / No Progress
+**Symptom**: State hash unchanged for multiple rounds
+
+**Solutions**:
+- ProgressTracker will auto-escalate and force finalization
+- Check if problem requires domain-specific adapter
+- Enable `--calibrate` to tune ahead-by-K
 
 ### Verifier Rejects All Solutions
 **Symptom**: Step retries exhaust without valid solution
