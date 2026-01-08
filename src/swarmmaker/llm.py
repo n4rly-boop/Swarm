@@ -2,6 +2,7 @@
 import copy
 import json
 import random
+import re
 import time
 from typing import Any, Callable, Dict, Optional, Sequence, TypeVar
 
@@ -10,6 +11,21 @@ from langchain_openai import ChatOpenAI
 from pydantic import ValidationError
 
 from .schemas import AgentCallMeta, SchemaValidationError, StructuredMode, StructuredParseResult
+
+
+def _strip_code_fences(text: str) -> str:
+    """Strip markdown code fences from LLM response.
+
+    Some models wrap JSON in ```json ... ``` blocks even when asked for raw JSON.
+    This function extracts the content inside the fences.
+    """
+    text = text.strip()
+    # Pattern: ```json or ``` at start, ``` at end
+    pattern = r'^```(?:json)?\s*\n?(.*?)\n?```$'
+    match = re.match(pattern, text, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return text
 
 T = TypeVar("T")
 
@@ -226,6 +242,9 @@ class LLMClient:
                 self.metrics.increment_retry()
                 time.sleep(min(2 ** attempt, 4.0))
                 continue
+
+            # Strip markdown code fences if present (some models wrap JSON despite instructions)
+            text = _strip_code_fences(text)
 
             # Validate JSON structure
             try:

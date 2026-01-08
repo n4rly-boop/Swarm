@@ -52,26 +52,23 @@ class CompletenessChecker:
                     "Rules:\n"
                     "- Extract ONLY requirements EXPLICITLY stated in the task text\n"
                     "- Do NOT invent requirements like 'show work' or 'provide steps' unless explicitly asked\n"
+                    "- For simple tasks (arithmetic, factual), the requirement is just the question itself\n"
                     "- For each requirement, determine if it is ADDRESSED or MISSING\n"
                     "- Be strict: vague or partial answers count as MISSING\n\n"
-                    "For missing_work items (CRITICAL):\n"
-                    "- Workers have ZERO context - they cannot see the task or answer\n"
-                    "- Each missing_work MUST be a self-contained calculation with ALL values inline\n"
-                    "- Use actual numbers from the answer, formatted as a direct computation\n"
-                    "Examples:\n"
-                    "  BAD: 'Calculate the sum of vectors to the points'\n"
-                    "  BAD: 'Calculate vector from origin to (3,4)'\n"
-                    "  GOOD: 'What is (3,4) + (1,-2)?'\n"
-                    "  GOOD: 'Compute 3 + 1 and 4 + (-2)'\n"
-                    "- Respond with JSON only, no prose"
+                    "Required JSON schema:\n"
+                    "{\n"
+                    '  "requirements": [{"requirement": "text", "status": "ADDRESSED"|"MISSING", "reason": "why"}],\n'
+                    '  "complete": true/false,\n'
+                    '  "missing_work": ["self-contained task to fill gap"]\n'
+                    "}\n\n"
+                    "Output JSON only, no markdown fences."
                 )
             ),
             HumanMessage(
                 content=(
                     f"Task: {task}\n\n"
                     f"Answer: {answer}"
-                    f"{context}\n\n"
-                    "Extract ONLY explicit requirements. Write missing_work as direct computations with all values."
+                    f"{context}"
                 )
             ),
         ]
@@ -79,8 +76,8 @@ class CompletenessChecker:
         result = self.llm.structured_completion(
             messages,
             meta=meta,
-            model=self.config.model_decomposer,
-            temperature=0.1,  # Low temperature for consistent verification
+            model=self.config.get_model("reasoning"),
+            temperature=self.config.thresholds.temperature_first_vote,  # Low temp for verification
             schema_name="CompletenessResult",
             schema=self.schema,
             parser=CompletenessResult.model_validate,
