@@ -1,7 +1,7 @@
 """Verification and quality gates for SwarmMaker."""
 import math
 import re
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
 
 try:
     import sympy as sp
@@ -17,6 +17,9 @@ from .schemas import (
     TaskState,
     ThresholdConfig,
 )
+
+if TYPE_CHECKING:
+    from .adapters.base import BaseDomainAdapter
 
 
 class StateVerifier:
@@ -231,15 +234,22 @@ class GlobalVerifier:
     This class handles:
     - Basic sanity checks (answer not empty)
     - Mathematical validation using sympy (if points are provided)
+    - Domain adapter verification (if adapter provided)
     """
 
-    def __init__(self, thresholds: Optional[ThresholdConfig] = None) -> None:
-        """Initialize verifier with thresholds.
+    def __init__(
+        self,
+        thresholds: Optional[ThresholdConfig] = None,
+        adapter: Optional["BaseDomainAdapter"] = None,
+    ) -> None:
+        """Initialize verifier with thresholds and optional adapter.
 
         Args:
             thresholds: Centralized threshold config. Uses defaults if None.
+            adapter: Optional domain adapter for specialized verification.
         """
         self.thresholds = thresholds or ThresholdConfig()
+        self.adapter = adapter
 
     def verify(
         self,
@@ -261,12 +271,26 @@ class GlobalVerifier:
         if not answer or len(answer) < 3:
             return False, "final answer is empty"
 
-        # Validate points mathematically if provided
+        # Domain adapter verification (has priority)
+        if self.adapter:
+            context = {
+                "task": task,
+                "equations": payload.support.equations if payload.support else [],
+                "points": [
+                    {"x": p.x, "y": p.y}
+                    for p in (payload.support.points if payload.support else [])
+                ],
+            }
+            ok, reason = self.adapter.verify_solution(answer, context)
+            if not ok:
+                return False, f"domain verification failed: {reason}"
+
+        # Validate points mathematically if provided (fallback sympy check)
         if payload.support and payload.support.points:
             ok, reason = self._verify_points(
                 task,
                 payload.support.points,
-                payload.support.equations,
+                payload.support.equations if payload.support else [],
             )
             if not ok:
                 return False, reason

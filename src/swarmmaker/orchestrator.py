@@ -10,7 +10,7 @@ This module coordinates all agents and implements the core algorithm:
 import hashlib
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from .completeness import CompletenessChecker
 from .composer import FinalComposer
@@ -35,6 +35,9 @@ from .schemas import (
 from .solver import AtomicSolver
 from .verify import GlobalVerifier, StateVerifier
 from .voting import DecompositionDiscriminator, SolutionDiscriminator
+
+if TYPE_CHECKING:
+    from .adapters.base import BaseDomainAdapter
 
 
 class OrchestratorError(RuntimeError):
@@ -165,6 +168,7 @@ class MakerRuntime:
     logger: EventLogger
     metrics: MetricsTracker
     progress_tracker: ProgressTracker
+    adapter: Optional["BaseDomainAdapter"] = None
     reporter: Optional[RunReporter] = None
 
 
@@ -300,7 +304,11 @@ class MakerOrchestrator:
     # -----------------------------------------------------------------------
 
     def _execute_direct_phase(self) -> Optional[FinalAnswer]:
-        """Attempt a direct low-cost solve before decomposition."""
+        """Attempt a direct low-cost solve before decomposition.
+
+        Per MAKER paper: First check if problem is atomic using the reasoning model,
+        then only solve with execution model if confirmed atomic.
+        """
         if not self.task_state:
             return None
 
@@ -314,7 +322,43 @@ class MakerOrchestrator:
             step_id=0,
         )
 
-        self._reporter_info("Attempting direct low-cost solve before decomposition.")
+        self._reporter_info("Checking if task is atomic before direct solve.")
+
+        # First, check if the problem is atomic using decomposer (reasoning model)
+        try:
+            proposals = self.runtime.decomposer.generate(
+                self.task_state.task,
+                depth=0,
+                step_id=0,
+                batch_size=2,  # Small batch for quick check
+                temperature=self.runtime.config.thresholds.temperature_first_vote,
+            )
+        except Exception as e:
+            self.runtime.logger.log(
+                "direct_atomicity_check_failed",
+                {"error": str(e)},
+                agent="orchestrator",
+                stage="direct",
+                step_id=0,
+            )
+            return None
+
+        # Count how many proposals say is_atomic
+        atomic_count = sum(1 for p in proposals if p.is_atomic)
+
+        # Only proceed with direct solve if majority says atomic
+        if atomic_count < len(proposals) / 2:
+            self._reporter_info("Task is not atomic; skipping direct solve phase.")
+            self.runtime.logger.log(
+                "direct_solve_skipped",
+                {"reason": "task not atomic", "atomic_count": atomic_count, "total": len(proposals)},
+                agent="orchestrator",
+                stage="direct",
+                step_id=0,
+            )
+            return None
+
+        self._reporter_info("Task confirmed atomic; attempting direct solve.")
 
         try:
             self._solve_atomic(

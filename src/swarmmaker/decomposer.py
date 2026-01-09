@@ -51,31 +51,40 @@ class Decomposer:
             messages = [
                 SystemMessage(
                     content=(
-                        "You are a MAKER decomposition specialist.\n"
-                        "Break the task into TWO smaller subproblems with a clear compose function.\n"
-                        "If the task is already atomic (cannot be meaningfully broken down), set is_atomic=true.\n\n"
-                        "Rules:\n"
-                        "- subproblem_a & subproblem_b must reduce the original task (no tautologies)\n"
-                        "- NEVER output 'solve y=... for y' or similar useless steps\n"
-                        "- compose_fn must explain EXACTLY how to combine their answers\n"
-                        "- Keep each field concise; respond with JSON only\n\n"
+                        "You are a MAKER decomposition specialist.\n\n"
+                        "CRITICAL: Mark is_atomic=true if ANY of these apply:\n"
+                        "- Single arithmetic operation (e.g., '5+7', 'x+5=12')\n"
+                        "- Simple algebraic step (e.g., 'isolate x', 'substitute y=3')\n"
+                        "- One-step calculation or lookup\n"
+                        "- Problem can be solved in one mental step\n"
+                        "- Problem is about identifying/extracting something\n\n"
+                        "Mark is_atomic=false ONLY if the problem has MULTIPLE DISTINCT steps that:\n"
+                        "- Require solving separate sub-tasks\n"
+                        "- Then combining their results\n\n"
+                        "Examples of ATOMIC (is_atomic=true):\n"
+                        "- 'What is 5 + 7?' → atomic\n"
+                        "- 'Solve x + 5 = 12' → atomic (one step: x = 12 - 5)\n"
+                        "- 'Substitute x=3 into y=2x' → atomic\n"
+                        "- 'Isolate x in x + y = 7' → atomic\n\n"
+                        "Examples of NON-ATOMIC (is_atomic=false):\n"
+                        "- 'Solve system: x+y=7, 2x-y=2, then calculate x*y' → 2 parts: solve system + multiply\n"
+                        "- 'Find intersection points and sum their coordinates' → find + sum\n\n"
                         "Required JSON schema:\n"
                         "{\n"
-                        '  "subproblem_a": "first subproblem (string, required)",\n'
-                        '  "subproblem_b": "second subproblem (string, required)",\n'
-                        '  "compose_fn": "how to combine results (string, required)",\n'
-                        '  "is_atomic": true/false (boolean, required),\n'
-                        '  "rationale": "why this decomposition (string, required)"\n'
+                        '  "subproblem_a": "first subproblem (string)",\n'
+                        '  "subproblem_b": "second subproblem (string)",\n'
+                        '  "compose_fn": "how to combine (string)",\n'
+                        '  "is_atomic": true/false,\n'
+                        '  "rationale": "why (string)"\n'
                         "}\n\n"
-                        "If is_atomic=true, still provide subproblem_a (the original problem), "
-                        "subproblem_b (empty or 'N/A'), and compose_fn ('Return result directly')."
+                        "If is_atomic=true: set subproblem_a to the problem, subproblem_b='N/A', compose_fn='Return directly'."
                     )
                 ),
                 HumanMessage(
                     content=(
                         f"Depth: {depth}\n"
                         f"Problem: {problem}\n"
-                        "Output JSON only, no markdown fences."
+                        "Output JSON only."
                     )
                 ),
             ]

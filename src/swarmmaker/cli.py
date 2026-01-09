@@ -39,8 +39,8 @@ from .voting import DecompositionDiscriminator, SolutionDiscriminator
 app = typer.Typer(add_completion=False, help="SwarmMaker MAKER orchestrator CLI.")
 
 # Default models for the two roles
-DEFAULT_REASONING_MODEL = "anthropic/claude-sonnet-4"
-DEFAULT_EXECUTION_MODEL = "anthropic/claude-sonnet-4"
+DEFAULT_REASONING_MODEL = "openai/gpt-4.1-mini"
+DEFAULT_EXECUTION_MODEL = "qwen/qwen2.5-coder-7b-instruct"
 
 
 @app.command()
@@ -143,9 +143,9 @@ def main(
     # Get domain adapter
     adapter = get_adapter(domain)
 
-    # Initialize verifiers with thresholds
+    # Initialize verifiers with thresholds and adapter
     verifier = StateVerifier(thresholds=config.thresholds)
-    global_verifier = GlobalVerifier(thresholds=config.thresholds)
+    global_verifier = GlobalVerifier(thresholds=config.thresholds, adapter=adapter)
 
     # Initialize red-flag guard with thresholds
     red_flag = RedFlagGuard(thresholds=config.thresholds)
@@ -178,6 +178,7 @@ def main(
         logger=events,
         metrics=metrics,
         progress_tracker=progress_tracker,
+        adapter=adapter,
         reporter=reporter,
     )
 
