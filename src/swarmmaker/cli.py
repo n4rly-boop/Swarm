@@ -66,6 +66,7 @@ def main(
     max_depth: int = typer.Option(6, "--max-depth", help="Maximum recursion depth."),
     # Resource limits
     max_total_tokens: int = typer.Option(50_000, "--max-total-tokens", help="Budget for all LLM calls."),
+    max_output_tokens: int = typer.Option(4096, "--max-output-tokens", help="Max tokens per LLM response."),
     timeout_seconds: int = typer.Option(60, "--timeout-seconds", help="Timeout per LLM call."),
     timeout_total: int = typer.Option(600, "--timeout-total", help="Total orchestrator timeout."),
     # Calibration
@@ -100,7 +101,7 @@ def main(
             reasoning=model_reasoning,
             execution=model_execution,
         ),
-        thresholds=ThresholdConfig(),
+        thresholds=ThresholdConfig(max_output_tokens=max_output_tokens),
         calibration=CalibrationConfig(enabled=calibrate),
         batch_size=batch_size,
         ahead_by=ahead_by,

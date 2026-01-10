@@ -152,6 +152,13 @@ class ThresholdConfig(BaseModel):
         description="Number of repetitions to trigger rejection.",
     )
 
+    # Output token limits
+    max_output_tokens: int = Field(
+        default=4096,
+        ge=256,
+        description="Maximum output tokens for LLM responses (increase for code generation).",
+    )
+
     # Verification thresholds
     sympy_tolerance: float = Field(
         default=1e-5,

@@ -87,6 +87,7 @@ class AtomicSolver:
                 schema_name="AtomicSolution",
                 schema=self.schema,
                 parser=AtomicSolution.model_validate,
+                max_output_tokens=self.config.thresholds.max_output_tokens,
             )
             candidates.append(result.content)
 
