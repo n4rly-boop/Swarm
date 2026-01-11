@@ -9,8 +9,8 @@ You are tasked with generating a comprehensive pull request description followin
 ## Steps to follow:
 
 1. **Read the PR description template:**
-   - First, check if `.claude/templates/pr_description.md` exists
-   - If it doesn't exist, inform the user they need to create a PR description template at `.claude/templates/pr_description.md`
+   - First, check if `.claude/artifacts/templates/pr_description.md` exists
+   - If it doesn't exist, inform the user they need to create a PR description template at `.claude/artifacts/templates/pr_description.md`
    - Read the template carefully to understand all sections and requirements
 
 
@@ -20,7 +20,7 @@ You are tasked with generating a comprehensive pull request description followin
    - Ask the user which PR they want to describe
 
 3. **Check for existing description:**
-   - Check if `.claude/prs/{number}_description.md` already exists
+   - Check if `.claude/artifacts/prs/{number}_description.md` already exists
    - If it exists, read it and inform the user you'll be updating it
    - Consider what has changed since the last description was written
 
@@ -57,11 +57,11 @@ You are tasked with generating a comprehensive pull request description followin
    - Ensure all checklist items are addressed (checked or explained)
 
 8. **Save the description:**
-   - Write the completed description to `.claude/prs/{number}_description.md`
+   - Write the completed description to `.claude/artifacts/prs/{number}_description.md`
    - Show the user the generated description
 
 9. **Update the PR:**
-   - Update the PR description directly: `gh pr edit {number} --body-file .claude/prs/{number}_description.md`
+   - Update the PR description directly: `gh pr edit {number} --body-file .claude/artifacts/prs/{number}_description.md`
    - Confirm the update was successful
    - If any verification steps remain unchecked, remind the user to complete them before merging
 

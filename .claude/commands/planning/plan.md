@@ -9,9 +9,9 @@ You are tasked with creating detailed, actionable implementation plans that foll
 
 ## Output Location
 
-Plans are stored in `.claude/plans/`:
+Plans are stored in `.claude/artifacts/plans/`:
 ```
-.claude/plans/
+.claude/artifacts/plans/
 ├── YYYY-MM-DD-short-description.md
 └── archive/                          # Completed plans
 ```
@@ -41,13 +41,13 @@ When invoked:
 
 1. **Load project conventions** (if they exist):
    ```
-   Read .claude/docs/conventions.md
-   Read .claude/docs/patterns.md
-   Read .claude/docs/architecture.md
-   Read .claude/docs/dependencies.md
+   Read .claude/artifacts/docs/conventions.md
+   Read .claude/artifacts/docs/patterns.md
+   Read .claude/artifacts/docs/architecture.md
+   Read .claude/artifacts/docs/dependencies.md
    ```
 
-   If `.claude/docs/` doesn't exist, suggest running `/extract_conventions` first, but continue anyway.
+   If `.claude/artifacts/docs/` doesn't exist, suggest running `/extract_conventions` first, but continue anyway.
 
 2. **Understand the task**:
    - Parse requirements from task description or ticket
@@ -98,7 +98,7 @@ When invoked:
 
 ### Phase 3: Write Plan
 
-Create `.claude/plans/YYYY-MM-DD-short-description.md`:
+Create `.claude/artifacts/plans/YYYY-MM-DD-short-description.md`:
 
 ```markdown
 # Plan: [Short Title]
@@ -174,7 +174,7 @@ Create `.claude/plans/YYYY-MM-DD-short-description.md`:
 
 ## References
 - Pattern source: `src/existing/similar.ts`
-- Convention: `.claude/docs/patterns.md#section`
+- Convention: `.claude/artifacts/docs/patterns.md#section`
 - Ticket: [PROJ-XXXX](link)
 ```
 
@@ -201,7 +201,7 @@ After writing the plan:
 
    **Key Risks**: [Top 1-2 risks]
 
-   Plan saved to: `.claude/plans/YYYY-MM-DD-description.md`
+   Plan saved to: `.claude/artifacts/plans/YYYY-MM-DD-description.md`
 
    Would you like me to:
    - Walk through any phase in detail?

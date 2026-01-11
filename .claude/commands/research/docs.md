@@ -16,7 +16,7 @@ docs/                    # Public documentation
 ├── guides/              # How-to guides
 └── architecture/        # System design docs
 
-.claude/docs/            # Internal conventions (from /extract_conventions)
+.claude/artifacts/docs/            # Internal conventions (from /extract_conventions)
 ```
 
 ## Usage

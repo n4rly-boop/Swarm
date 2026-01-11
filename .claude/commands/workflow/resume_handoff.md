@@ -13,7 +13,7 @@ When this command is invoked:
 1. **If the path to a handoff document was provided**:
    - If a handoff document path was provided as a parameter, skip the default message
    - Immediately read the handoff document FULLY
-   - Immediately read any research or plan documents that it links to under `.claude/plans` or `.claude/research`. do NOT use a sub-agent to read these critical files.
+   - Immediately read any research or plan documents that it links to under `.claude/artifacts/plans` or `.claude/artifacts/research`. do NOT use a sub-agent to read these critical files.
    - Begin the analysis process by ingesting relevant context from the handoff document, reading additional files it mentions
    - Then propose a course of action to the user and confirm, or ask for clarification on direction.
 
@@ -21,13 +21,13 @@ When this command is invoked:
 ```
 I'll help you resume work from a handoff document.
 
-Let me list available handoffs in `.claude/handoffs/`:
+Let me list available handoffs in `.claude/artifacts/handoffs/`:
 
 [List directory contents]
 
 Which handoff would you like to resume from?
 
-Tip: You can invoke this command directly with a handoff path: `/resume_handoff .claude/handoffs/YYYY-MM-DD_HH-MM-SS_description.md`
+Tip: You can invoke this command directly with a handoff path: `/resume_handoff .claude/artifacts/handoffs/YYYY-MM-DD_HH-MM-SS_description.md`
 ```
 
 Then wait for the user's input.

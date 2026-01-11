@@ -9,9 +9,9 @@ You are tasked with analyzing a codebase to extract and document all conventions
 
 ## Output Location
 
-All extracted documentation goes to `.claude/docs/` in the repository root:
+All extracted documentation goes to `.claude/artifacts/docs/` in the repository root:
 ```
-.claude/docs/
+.claude/artifacts/docs/
 ├── conventions.md      # Code style, naming, file structure
 ├── patterns.md         # Common implementation patterns
 ├── architecture.md     # Service boundaries, data flow, infrastructure
@@ -102,7 +102,7 @@ Create dependency map with version requirements.
 
 ### Phase 4: Write Documentation
 
-Create/update each file in `.claude/docs/`:
+Create/update each file in `.claude/artifacts/docs/`:
 
 #### conventions.md Structure:
 ```markdown
@@ -239,7 +239,7 @@ src/
 
 ## Incremental Updates
 
-If `.claude/docs/` already exists:
+If `.claude/artifacts/docs/` already exists:
 1. Read existing documentation first
 2. Compare with current analysis
 3. Highlight what changed (new patterns, deprecated patterns)
@@ -252,10 +252,10 @@ After writing all files, provide a summary:
 ## Extraction Complete
 
 Created/Updated:
-- .claude/docs/conventions.md (X naming rules, Y style guidelines)
-- .claude/docs/patterns.md (X patterns documented)
-- .claude/docs/architecture.md (X modules mapped)
-- .claude/docs/dependencies.md (X internal, Y external deps)
+- .claude/artifacts/docs/conventions.md (X naming rules, Y style guidelines)
+- .claude/artifacts/docs/patterns.md (X patterns documented)
+- .claude/artifacts/docs/architecture.md (X modules mapped)
+- .claude/artifacts/docs/dependencies.md (X internal, Y external deps)
 
 Key Findings:
 - [Notable pattern or convention]

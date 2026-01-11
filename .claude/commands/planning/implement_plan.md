@@ -4,7 +4,7 @@ description: Implement technical plans from .claude/plans with verification
 
 # Implement Plan
 
-You are tasked with implementing an approved technical plan from `.claude/plans/`. These plans contain phases with specific changes and success criteria.
+You are tasked with implementing an approved technical plan from `.claude/artifacts/plans/`. These plans contain phases with specific changes and success criteria.
 
 ## Getting Started
 

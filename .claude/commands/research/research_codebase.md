@@ -72,7 +72,7 @@ Then wait for the user's research query.
    - Answer the user's specific questions with concrete evidence
 
 5. **Gather metadata for the research document:**
-   - Filename: `.claude/research/YYYY-MM-DD-description.md`
+   - Filename: `.claude/artifacts/research/YYYY-MM-DD-description.md`
      - Format: `YYYY-MM-DD-description.md` where:
        - YYYY-MM-DD is today's date
        - description is a brief kebab-case description of the research topic
@@ -124,7 +124,7 @@ Then wait for the user's research query.
      [Current patterns, conventions, and design implementations found in the codebase]
 
      ## Related Research
-     [Links to other research documents in .claude/research/]
+     [Links to other research documents in .claude/artifacts/research/]
 
      ## Open Questions
      [Any areas that need further investigation]
