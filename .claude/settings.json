@@ -1,21 +1,4 @@
 {
-  "permissions": {
-    "allow": [
-      "Bash(python -m swarmmaker:*)",
-      "Bash(cat:*)",
-      "Bash(find:*)",
-      "Bash(wc:*)",
-      "Bash(python -c:*)",
-      "WebFetch(domain:arxiv.org)",
-      "Bash(source:*)",
-      "Bash(python3:*)",
-      "Bash(for i in 1 2 3)",
-      "Bash(do echo \"=== Run $i ===\")",
-      "Bash(done)",
-      "Bash(timeout 60 python:*)",
-      "Bash(python:*)"
-    ]
-  },
   "hooks": {
     "Stop": [
       {
