@@ -215,6 +215,7 @@ def main(
     finally:
         elapsed = time.perf_counter() - start
         typer.echo(f"Elapsed: {elapsed:.2f}s")
+        events.flush()  # Ensure all events written before exit
 
     # Save results
     result.artifacts.events_path = events_path

@@ -8,6 +8,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
+from functools import cached_property
 from pathlib import Path
 from typing import Any, Callable, Dict, Generic, List, Literal, Optional, Protocol, Tuple, TypeVar
 
@@ -291,7 +292,7 @@ class DecompositionProposal(BaseModel):
     )
     rationale: str = Field(min_length=1, description="Why this decomposition is appropriate.")
 
-    @property
+    @cached_property
     def signature(self) -> str:
         return canonical_json({
             "subproblem_a": self.subproblem_a.strip(),
@@ -310,7 +311,7 @@ class AtomicSolution(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     work_shown: str = Field(min_length=1, description="Audit trail for the answer.")
 
-    @property
+    @cached_property
     def signature(self) -> str:
         return canonical_json({"solution": self.solution.strip()})
 

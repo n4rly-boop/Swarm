@@ -4,7 +4,8 @@ import json
 import random
 import re
 import time
-from typing import Any, Callable, Dict, Optional, Sequence, TypeVar
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar
 
 from langchain_core.messages import BaseMessage
 from langchain_openai import ChatOpenAI
@@ -120,6 +121,8 @@ class LLMClient:
         self.metrics = metrics
         self.structured_mode = structured_mode
         self.dry_run = dry_run
+        # Cache base LLM instances by model to avoid recreation overhead
+        self._client_cache: Dict[str, ChatOpenAI] = {}
 
     def structured_completion(
         self,
@@ -155,6 +158,73 @@ class LLMClient:
             max_output_tokens=max_output_tokens,
         )
 
+    def structured_completion_batch(
+        self,
+        messages_list: List[Sequence[BaseMessage]],
+        *,
+        meta_base: AgentCallMeta,
+        model: str,
+        temperature: float,
+        schema_name: str,
+        schema: Dict[str, Any],
+        parser: Callable[[Any], T],
+        max_output_tokens: Optional[int] = None,
+        max_workers: int = 4,
+    ) -> List[StructuredParseResult[T]]:
+        """Execute multiple structured completions in parallel.
+
+        Args:
+            messages_list: List of message sequences, one per candidate.
+            meta_base: Base metadata (stage will be augmented per call).
+            model: Model identifier.
+            temperature: Sampling temperature.
+            schema_name: Name for the schema.
+            schema: JSON schema for structured output.
+            parser: Function to parse response into type T.
+            max_output_tokens: Optional token limit.
+            max_workers: Maximum parallel threads.
+
+        Returns:
+            List of parsed results in same order as input.
+        """
+        results: List[Optional[StructuredParseResult[T]]] = [None] * len(messages_list)
+        errors: List[Optional[Exception]] = [None] * len(messages_list)
+
+        def invoke_one(idx: int) -> Tuple[int, StructuredParseResult[T]]:
+            meta = AgentCallMeta(
+                agent=meta_base.agent,
+                stage=f"{meta_base.stage}#{idx}",
+                step_id=meta_base.step_id,
+                voter_id=idx,
+            )
+            return idx, self.structured_completion(
+                messages_list[idx],
+                meta=meta,
+                model=model,
+                temperature=temperature,
+                schema_name=schema_name,
+                schema=schema,
+                parser=parser,
+                max_output_tokens=max_output_tokens,
+            )
+
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(messages_list))) as executor:
+            futures = {executor.submit(invoke_one, i): i for i in range(len(messages_list))}
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    _, result = future.result()
+                    results[idx] = result
+                except Exception as e:
+                    errors[idx] = e
+
+        # Raise first error if any failed
+        for idx, err in enumerate(errors):
+            if err is not None:
+                raise err
+
+        return [r for r in results if r is not None]
+
     def _invoke_with_retry(
         self,
         messages: Sequence[BaseMessage],
@@ -172,16 +242,19 @@ class LLMClient:
         
         for attempt in range(attempts):
             try:
-                # Create LLM instance with enforced structured output format
-                llm = ChatOpenAI(
-                    model=model,
+                # Create or reuse base LLM instance, apply call-specific params via bind()
+                if model not in self._client_cache:
+                    self._client_cache[model] = ChatOpenAI(
+                        model=model,
+                        timeout=self.timeout,
+                        streaming=False,
+                        openai_api_key=self.api_key,
+                        base_url=self.base_url,
+                    )
+                llm = self._client_cache[model].bind(
                     temperature=temperature,
-                    timeout=self.timeout,
-                    streaming=False,
-                    openai_api_key=self.api_key,
-                    base_url=self.base_url,
                     max_tokens=max_output_tokens,
-                    model_kwargs={"response_format": response_format},
+                    response_format=response_format,
                 )
                 
                 tags = [
@@ -228,8 +301,9 @@ class LLMClient:
                 raise
             except Exception as err:  # pragma: no cover - network
                 last_error = err
-                if attempt == attempts - 1 or not self._should_retry(err):
-                    # Provide helpful error message for schema-related failures
+                # Check retryable FIRST, before attempting retry
+                if not self._should_retry(err):
+                    # Not a transient error - fail immediately
                     err_text = str(err).lower()
                     if self.structured_mode == StructuredMode.json_schema and (
                         "schema" in err_text or "response_format" in err_text or "json_schema" in err_text
@@ -238,6 +312,9 @@ class LLMClient:
                             "json_schema response_format failed; rerun with --structured-mode json_object "
                             f"or choose a provider that supports schemas. Original error: {err}"
                         ) from err
+                    raise
+                if attempt == attempts - 1:
+                    # Last attempt exhausted
                     raise
                 self.metrics.increment_retry()
                 time.sleep(min(2 ** attempt, 4.0))
@@ -280,8 +357,17 @@ class LLMClient:
 
     def _should_retry(self, err: Exception) -> bool:
         """Determines if an error is transient and worth retrying."""
+        # Check exception types first (more reliable than string matching)
+        if isinstance(err, (TimeoutError, ConnectionError, ConnectionResetError)):
+            return True
+
+        # Fall back to string matching for provider-specific errors
         text = str(err).lower()
-        transient_tokens = ("timeout", "temporarily", "rate limit", "unavailable", "overloaded")
+        transient_tokens = (
+            "timeout", "temporarily", "rate limit", "rate_limit",
+            "unavailable", "overloaded", "connection", "retry",
+            "503", "502", "429",  # HTTP status codes
+        )
         return any(tok in text for tok in transient_tokens)
 
     def _dry_payload(self, meta: AgentCallMeta, schema_name: str) -> Dict[str, Any]:

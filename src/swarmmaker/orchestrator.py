@@ -492,6 +492,7 @@ class MakerOrchestrator:
         payload: Optional[FinalAnswer] = None
 
         for attempt in range(2):
+            self._check_timeout()  # Check deadline each attempt
             step_id = self._next_step_id()
 
             # Compose with error handling
@@ -592,6 +593,7 @@ class MakerOrchestrator:
                 self._reporter_info(f"Filling {len(completeness.missing_work)} missing requirement(s).")
 
                 for missing in completeness.missing_work:
+                    self._check_timeout()  # Check deadline before each gap fill
                     try:
                         gap_solution = self._solve_atomic(
                             missing,

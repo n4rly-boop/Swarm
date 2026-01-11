@@ -1,7 +1,8 @@
 """IO helpers for SwarmMaker runs."""
+import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from .schemas import RunResult, canonical_json
 
@@ -12,10 +13,12 @@ def ensure_log_dir(path: Path) -> Path:
 
 
 class EventLogger:
-    """Append-only JSONL logger with canonical serialization."""
+    """Append-only JSONL logger with buffered writes."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, buffer_size: int = 10) -> None:
         self.path = path
+        self.buffer_size = buffer_size
+        self._buffer: List[str] = []
         ensure_log_dir(self.path.parent)
         if not self.path.exists():
             self.path.touch()
@@ -43,21 +46,50 @@ class EventLogger:
             "model": model,
             "payload": payload or {},
         }
-        with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(canonical_json(entry) + "\n")
+        self._buffer.append(canonical_json(entry))
+        if len(self._buffer) >= self.buffer_size:
+            self.flush()
+
+    def flush(self) -> None:
+        """Write buffered events to file."""
+        if not self._buffer:
+            return
+        try:
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write("\n".join(self._buffer) + "\n")
+            self._buffer.clear()
+        except OSError as e:
+            print(f"[EventLogger] Flush failed: {e}", file=sys.stderr)
+            self._buffer.clear()  # Avoid unbounded growth
+
+    def __del__(self) -> None:
+        """Flush remaining events on cleanup."""
+        self.flush()
 
 
-def save_json_result(result: RunResult, path: Path) -> None:
+def save_json_result(result: RunResult, path: Path) -> bool:
+    """Save JSON result to file. Returns True on success."""
     ensure_log_dir(path.parent)
     payload = result.model_dump(mode="python")
-    with path.open("w", encoding="utf-8") as handle:
-        handle.write(canonical_json(payload))
+    try:
+        with path.open("w", encoding="utf-8") as handle:
+            handle.write(canonical_json(payload))
+        return True
+    except OSError as e:
+        print(f"[save_json_result] Write failed: {e}", file=sys.stderr)
+        return False
 
 
-def save_markdown_result(result: RunResult, path: Path) -> None:
+def save_markdown_result(result: RunResult, path: Path) -> bool:
+    """Save markdown result to file. Returns True on success."""
     ensure_log_dir(path.parent)
-    with path.open("w", encoding="utf-8") as handle:
-        handle.write(render_result_markdown(result))
+    try:
+        with path.open("w", encoding="utf-8") as handle:
+            handle.write(render_result_markdown(result))
+        return True
+    except OSError as e:
+        print(f"[save_markdown_result] Write failed: {e}", file=sys.stderr)
+        return False
 
 
 def render_result_markdown(result: RunResult) -> str:
