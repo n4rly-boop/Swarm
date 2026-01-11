@@ -19,10 +19,11 @@ You are tasked with creating git commits for the changes made during this sessio
    - Draft clear, descriptive commit messages
    - Use imperative mood in commit messages
    - Focus on why the changes were made, not just what
+   - Use the same format for commit messages as the repository's commit message format
 
 3. **Execute upon confirmation:**
    - Use `git add` with specific files (never use `-A` or `.`)
-   - Never commit the `thoughts/` directory or anything inside it!
+   - Never commit generated files or temporary artifacts
    - Never commit dummy files, test scripts, or other files which you created or which appear to have been created but which were not part of your changes or directly caused by them (e.g. generated code)
    - Create commits with your planned messages until all of your changes are committed with `git commit -m`
 

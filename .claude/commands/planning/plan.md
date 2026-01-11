@@ -25,8 +25,7 @@ When invoked:
    - Begin research immediately
 
 2. **If ticket reference provided** (e.g., `/plan PROJ-1234`):
-   - Fetch ticket details using `/youtrack PROJ-1234` if available
-   - Or ask user to paste ticket content
+   - Ask user to paste ticket content
 
 3. **If no parameters**:
    ```

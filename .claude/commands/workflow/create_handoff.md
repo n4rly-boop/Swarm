@@ -10,16 +10,11 @@ You are tasked with writing a handoff document to hand off your work to another 
 ## Process
 ### 1. Filepath & Metadata
 Use the following information to understand how to create your document:
-    - create your file under `thoughts/shared/handoffs/ENG-XXXX/YYYY-MM-DD_HH-MM-SS_ENG-ZZZZ_description.md`, where:
+    - create your file under `.claude/handoffs/YYYY-MM-DD_HH-MM-SS_description.md`, where:
         - YYYY-MM-DD is today's date
         - HH-MM-SS is the hours, minutes and seconds based on the current time, in 24-hour format (i.e. use `13:00` for `1:00 pm`)
-        - ENG-XXXX is the ticket number (replace with `general` if no ticket)
-        - ENG-ZZZZ is the ticket number (omit if no ticket)
         - description is a brief kebab-case description
-    - Run the `scripts/spec_metadata.sh` script to generate all relevant metadata
-    - Examples:
-        - With ticket: `2025-01-08_13-55-22_ENG-2166_create-context-compaction.md`
-        - Without ticket: `2025-01-08_13-55-22_create-context-compaction.md`
+    - Example: `2025-01-08_13-55-22_create-context-compaction.md`
 
 ### 2. Handoff writing.
 using the above conventions, write your document. use the defined filepath, and the following YAML frontmatter pattern. Use the metadata gathered in step 1, Structure the document with YAML frontmatter followed by content:
@@ -28,7 +23,6 @@ Use the following template structure:
 ```markdown
 ---
 date: [Current date and time with timezone in ISO format]
-researcher: [Researcher name from thoughts status]
 git_commit: [Current commit hash]
 branch: [Current branch name]
 repository: [Repository name]
@@ -36,11 +30,10 @@ topic: "[Feature/Task Name] Implementation Strategy"
 tags: [implementation, strategy, relevant-component-names]
 status: complete
 last_updated: [Current date in YYYY-MM-DD format]
-last_updated_by: [Researcher name]
 type: implementation_strategy
 ---
 
-# Handoff: ENG-XXXX {very concise description}
+# Handoff: {very concise description}
 
 ## Task(s)
 {description of the task(s) that you were working on, along with the status of each (completed, work in progress, planned/discussed). If you are working on an implementation plan, make sure to call out which phase you are on. Make sure to reference the plan document and/or research document(s) you are working from that were provided to you at the beginning of the session, if applicable.}
@@ -65,8 +58,7 @@ type: implementation_strategy
 ```
 ---
 
-### 3. Approve and Sync
-Run `humanlayer thoughts sync` to save the document.
+### 3. Save the document
 
 Once this is completed, you should respond to the user with the template between <template_response></template_response> XML tags. do NOT include the tags in your response.
 
@@ -84,7 +76,7 @@ for example (between <example_response></example_response> XML tags - do NOT inc
 Handoff created and synced! You can resume from this handoff in a new session with the following command:
 
 ```bash
-/resume_handoff thoughts/shared/handoffs/ENG-2166/2025-01-08_13-44-55_ENG-2166_create-context-compaction.md
+/resume_handoff .claude/handoffs/2025-01-08_13-44-55_create-context-compaction.md
 ```
 </example_response>
 

@@ -19,6 +19,9 @@ You are tasked with creating git commits for the changes made during this sessio
    - Draft clear, descriptive commit messages
    - Use imperative mood in commit messages
    - Focus on why the changes were made, not just what
+   - Use the same format for commit messages as the repository's commit message format
+   - If anything is unclear, ask the user for clarification
+
 
 3. **Present your plan to the user:**
    - List the files you plan to add for each commit
